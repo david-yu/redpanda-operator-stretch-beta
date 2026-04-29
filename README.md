@@ -2,9 +2,9 @@
 
 A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`, validated on AWS EKS in `us-east-1`, `us-west-2`, and `eu-west-1`, peered via Transit Gateway.
 
-This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference; this repo's `manifests/` and `helm-values/` reflect the values that actually work — see [Troubleshooting](#troubleshooting) for the why behind each one.
+This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference; this repo's `terraform/`, `manifests/`, and `helm-values/` reflect the configs that actually work — see [Troubleshooting](#troubleshooting) for the why behind each one.
 
-> **Coming soon:** GCP (GKE) example configs and a Terraform module for provisioning the Kubernetes clusters + cross-region networking. The current AWS flow uses `eksctl` + a shell script for TGW setup; these will be replaced with reproducible Terraform that also covers GKE + VPC Network Peering / Network Connectivity Center.
+> **Coming soon:** GCP (GKE) examples — VPC Network Peering / Network Connectivity Center wiring and equivalent Terraform modules for cross-cloud StretchCluster validation.
 
 ## Final state
 
@@ -33,9 +33,7 @@ ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VER
 ## Repo layout
 
 ```
-eksctl/                     — eksctl ClusterConfig, one per region
-scripts/setup-tgw.sh        — Transit Gateway + peering + routes + SG opener
-manifests/peer-svc-*.yaml   — pre-created peer LB Services (NLB internal)
+terraform/                  — VPCs, EKS clusters, TGW peering, AWS LB Controller, peer LB Services (steps 1–4)
 manifests/stretchcluster.yaml
 manifests/nodepool-*.yaml
 helm-values/values-*.example.yaml — fill in placeholders before use
@@ -67,7 +65,7 @@ Two transports:
 | Tool | Min version |
 |---|---|
 | `aws` CLI v2 with credentials configured | — |
-| `eksctl` | 0.225.0 |
+| `terraform` | ≥ 1.6 |
 | `kubectl` | matches EKS K8s version (1.31 here) |
 | `helm` | ≥ 3.14 |
 | `rpk` | with the v26.2.1-beta.1 `rpk-k8s` plugin (see below) |
@@ -88,117 +86,46 @@ rpk k8s multicluster --help
 
 ## Step-by-step
 
-The flow is: provision → network → install LB controller → bootstrap multicluster → install operator → apply CRs → verify.
+The flow is: Terraform provisions infrastructure (steps 1–4 — EKS, networking, LB Controller, peer Services) → manual steps (5+) bootstrap multicluster, install the operator and StretchCluster.
 
-### 1. Provision 3 EKS clusters
+### 1. Provision infrastructure (Terraform)
+
+`terraform/` configures everything that needs to exist before `rpk k8s multicluster bootstrap`:
+
+- 3× EKS clusters with VPC, NAT gateways, EBS CSI driver IRSA, and `gp2` annotated default
+- 3× Transit Gateways with full-mesh inter-region peering, route tables, and SG ingress for ports 9443/33145/9093/8082/9644 across peer CIDRs
+- AWS Load Balancer Controller (helm + IRSA) per cluster
+- Pre-created `<cluster>-multicluster-peer` LoadBalancer Service per cluster (NLB internal, port 9443)
 
 ```bash
 export AWS_PROFILE=<your-profile>
 
-eksctl create cluster -f eksctl/rp-east.yaml --kubeconfig ~/.kube/rp-east.kubeconfig &
-eksctl create cluster -f eksctl/rp-west.yaml --kubeconfig ~/.kube/rp-west.kubeconfig &
-eksctl create cluster -f eksctl/rp-eu.yaml   --kubeconfig ~/.kube/rp-eu.kubeconfig &
-wait
+cd terraform
+terraform init
+terraform apply
 ```
 
-Each control plane takes ~15–20 minutes; the nodegroup adds another ~5. Run them in parallel.
+First apply takes ~20–25 minutes (EKS control planes are the long pole; everything else runs in parallel). See [terraform/README.md](terraform/README.md) for variables and tuning.
 
-Rename the long EKS context names to short forms and merge into your default kubeconfig:
-
-```bash
-for K in east west eu; do
-  KC=~/.kube/rp-$K.kubeconfig
-  ARN=$(KUBECONFIG=$KC kubectl config current-context)
-  KUBECONFIG=$KC kubectl config rename-context "$ARN" "rp-$K"
-done
-
-KUBECONFIG=~/.kube/config:~/.kube/rp-east.kubeconfig:~/.kube/rp-west.kubeconfig:~/.kube/rp-eu.kubeconfig \
-  kubectl config view --merge --flatten > ~/.kube/config.merged
-mv ~/.kube/config.merged ~/.kube/config
-chmod 600 ~/.kube/config
-```
-
-Verify:
+Register the three clusters as kubectl contexts named `rp-east`, `rp-west`, `rp-eu`:
 
 ```bash
+terraform output -raw kubectl_setup_commands | bash
+
+# verify
 for C in rp-east rp-west rp-eu; do
   kubectl --context "$C" get nodes
 done
 ```
 
-### 2. AWS Transit Gateway + cross-region peering
+Capture the values needed by the next steps (helm-values templates have placeholders matching these names):
 
 ```bash
-bash scripts/setup-tgw.sh
+terraform output peer_lb_hostnames
+terraform output eks_endpoints
 ```
 
-The script:
-1. Looks up VPC IDs from each `eksctl-rp-<region>-cluster` CFN stack.
-2. Creates a TGW per region (random ASN in 64512–65511).
-3. Attaches each VPC to its local TGW (private subnets).
-4. Creates inter-region peering attachments (full mesh).
-5. Auto-accepts each peering on the receiver side.
-6. Adds static routes in each TGW route table for the two remote VPC CIDRs.
-7. Adds VPC route table entries pointing the remote CIDRs at the local TGW.
-8. Opens **9443 (operator raft), 33145 (broker RPC), 9093 (Kafka), 8082 (Pandaproxy), 9644 (Admin API)** ingress on the cluster node SGs from peer VPC CIDRs and (for 9443) the local CIDR (for NLB SNAT).
-
-CIDR plan: rp-east `10.10.0.0/16`, rp-west `10.20.0.0/16`, rp-eu `10.30.0.0/16`. Non-overlapping is required for TGW.
-
-### 3. AWS Load Balancer Controller per cluster
-
-```bash
-# IAM policy (one global, per AWS account)
-curl -sSL -o /tmp/aws-lbc-iam-policy.json \
-  https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
-POLICY_ARN=$(aws iam create-policy \
-  --policy-name AWSLoadBalancerControllerIAMPolicy-rpstretch \
-  --policy-document file:///tmp/aws-lbc-iam-policy.json \
-  --query 'Policy.Arn' --output text)
-
-# Per cluster: IRSA + helm install
-for entry in "rp-east:us-east-1" "rp-west:us-west-2" "rp-eu:eu-west-1"; do
-  C=${entry%%:*}; R=${entry##*:}
-  eksctl create iamserviceaccount \
-    --cluster=$C --region=$R \
-    --namespace=kube-system --name=aws-load-balancer-controller \
-    --attach-policy-arn=$POLICY_ARN \
-    --override-existing-serviceaccounts --approve
-done
-
-helm repo add eks https://aws.github.io/eks-charts --force-update && helm repo update
-
-for C in rp-east rp-west rp-eu; do
-  helm --kube-context "$C" upgrade --install aws-load-balancer-controller \
-    eks/aws-load-balancer-controller \
-    -n kube-system \
-    --set clusterName="$C" \
-    --set serviceAccount.create=false \
-    --set serviceAccount.name=aws-load-balancer-controller \
-    --wait --timeout 5m &
-done
-wait
-```
-
-### 4. Pre-create peer LB Services (with NLB-internal annotations)
-
-The `rpk k8s multicluster bootstrap` CLI doesn't expose an annotations flag, so a default `--loadbalancer` run produces a Classic ELB internet-facing LB. Pre-creating the Service first and letting bootstrap reuse it (via `controllerutil.CreateOrUpdate`) is how you get a proper internal NLB:
-
-```bash
-kubectl --context rp-east apply -f manifests/peer-svc-rp-east.yaml
-kubectl --context rp-west apply -f manifests/peer-svc-rp-west.yaml
-kubectl --context rp-eu   apply -f manifests/peer-svc-rp-eu.yaml
-```
-
-Wait until each Service has a `status.loadBalancer.ingress[0].hostname`:
-
-```bash
-for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" -n redpanda get svc "${C}-multicluster-peer" \
-    -o jsonpath="{.metadata.name}: {.status.loadBalancer.ingress[0].hostname}{'\n'}"
-done
-```
-
-### 5. Bootstrap multicluster TLS + kubeconfig secrets
+### 2. Bootstrap multicluster TLS + kubeconfig secrets
 
 ```bash
 rpk k8s multicluster bootstrap \
@@ -232,7 +159,7 @@ for C in rp-east rp-west rp-eu; do
 done
 ```
 
-### 6. License Secret + helm install
+### 3. License Secret + helm install
 
 The license itself is **never committed**. Place your license at a local path and create the Secret per cluster:
 
@@ -268,9 +195,9 @@ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu 
 
 You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, `UNHEALTHY=0`, and the four cross-cluster checks ✓.
 
-### 7. cert-manager per cluster
+### 4. cert-manager per cluster
 
-Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment. cert-manager is independent of steps 3–6 and can be installed any time before step 8 (in parallel with the others if you want to save wall-clock time).
+Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment. cert-manager is independent of steps 1–3 and can be installed any time before step 5 (in parallel if you want to save wall-clock time).
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io --force-update && helm repo update
@@ -285,16 +212,9 @@ done
 wait
 ```
 
-### 8. Apply StretchCluster + NodePools
+### 5. Apply StretchCluster + NodePools
 
-If `gp2` is not the default StorageClass on your EKS nodes (newer EKS versions don't ship one annotated default):
-
-```bash
-for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" patch storageclass gp2 -p \
-    '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-done
-```
+(Terraform already annotates `gp2` as the default StorageClass — see step 1.)
 
 Apply the StretchCluster (identical on every cluster):
 
@@ -314,7 +234,7 @@ kubectl --context rp-eu   -n redpanda apply -f manifests/nodepool-rp-eu.yaml
 
 The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate for TGW), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). Both differ from the gist; see [Troubleshooting](#troubleshooting) issues 7–8.
 
-### 9. Wait for green
+### 6. Wait for green
 
 ```bash
 kubectl --context rp-east -n redpanda get stretchcluster redpanda \
@@ -374,7 +294,7 @@ aws ec2 describe-security-groups --region us-east-1 --group-ids <node-sg> \
 
 ### 3. NLB ends up internet-facing instead of internal
 
-Bootstrap with `--loadbalancer` creates a vanilla `LoadBalancer` Service without AWS LB annotations. The CLI has no `--annotations` flag; the underlying `PeerLoadBalancerConfig.Annotations` field is never populated from the CLI. **Pre-create the Service** (`manifests/peer-svc-*.yaml`) with `aws-load-balancer-scheme: internal` etc., wait for the address to provision, then run bootstrap — `controllerutil.CreateOrUpdate` reuses the existing Service and preserves your annotations.
+Bootstrap with `--loadbalancer` creates a vanilla `LoadBalancer` Service without AWS LB annotations. The CLI has no `--annotations` flag; the underlying `PeerLoadBalancerConfig.Annotations` field is never populated from the CLI. **Pre-create the Service** with `aws-load-balancer-scheme: internal` etc. (Terraform's `peer_services.tf` does this for you — see `kubernetes_service.peer_*`), wait for the address to provision, then run bootstrap — `controllerutil.CreateOrUpdate` reuses the existing Service and preserves your annotations.
 
 ### 4. Operator pods crashloop after install with "duplicate peer name" / raft can't form
 
@@ -426,15 +346,13 @@ The operator wants to convert per-pod Services to headless (clusterIP=None) for 
 
 ### 10. `rpk topic create` from inside a broker pod hangs / "i/o timeout" on port 9093
 
-The Kafka client port `9093` (and the Pandaproxy `8082`, Admin `9644` ports for that matter) are not open across cluster CIDRs in security groups by default. The original gist only mentions `33145`. Add `9093`, `8082`, `9644` to the cross-cluster ingress rules — `setup-tgw.sh` already does this.
+The Kafka client port `9093` (and the Pandaproxy `8082`, Admin `9644` ports for that matter) are not open across cluster CIDRs in security groups by default. The original gist only mentions `33145`. Add `9093`, `8082`, `9644` to the cross-cluster ingress rules — `terraform/sg.tf` already does this via the `cross_cluster_ports` variable.
 
 ### 11. PVC `Pending`: "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims"
 
-Newer EKS doesn't ship `gp2` (or anything) annotated as the default StorageClass, and the chart's PVC template doesn't pin a class. Either:
-- Patch `gp2` as default: `kubectl patch storageclass gp2 -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'`
-- Or specify the StorageClass explicitly in the StretchCluster `storage` spec.
+Newer EKS doesn't ship `gp2` (or anything) annotated as the default StorageClass, and the chart's PVC template doesn't pin a class. The Terraform in this repo annotates `gp2` as default automatically (`terraform/eks.tf`, `kubernetes_annotations.gp2_default_*`). If you provisioned EKS some other way, either patch `gp2` as default or set `storage.persistentVolume.storageClass` in the StretchCluster spec.
 
-If the PVC was created **before** you patched the default class, delete the stuck PVC and pod so they get recreated picking up the new default:
+If the PVC was created **before** the default class annotation existed, delete the stuck PVC and pod so they get recreated picking up the new default:
 ```bash
 kubectl --context <c> -n redpanda delete pvc datadir-redpanda-<pool>-0
 kubectl --context <c> -n redpanda delete pod redpanda-<pool>-0 --grace-period=0 --force
@@ -454,10 +372,10 @@ done
 
 ## Tear down
 
-In order, on every cluster:
+Workload first (StretchCluster has a deletion finalizer that needs every cluster reachable), then helm releases, then `terraform destroy` for the infrastructure:
 
 ```bash
-# 1. Delete StretchCluster on every cluster (the deletion finalizer requires this).
+# 1. Delete StretchCluster on every cluster.
 for C in rp-east rp-west rp-eu; do
   kubectl --context "$C" -n redpanda delete stretchcluster redpanda --wait=false
 done
@@ -465,26 +383,17 @@ for C in rp-east rp-west rp-eu; do
   kubectl --context "$C" -n redpanda wait --for=delete stretchcluster/redpanda --timeout=10m
 done
 
-# 2. Uninstall helm releases.
+# 2. Uninstall the operator helm releases.
 for C in rp-east rp-west rp-eu; do
   helm --kube-context "$C" uninstall "$C" -n redpanda
 done
 
-# 3. Delete TGWs (peerings, attachments, route tables clean up automatically).
-#    (Or just delete the EKS clusters and AWS will free TGW VPC attachments.)
-
-# 4. Delete EKS clusters.
-eksctl delete cluster --name rp-east --region us-east-1 &
-eksctl delete cluster --name rp-west --region us-west-2 &
-eksctl delete cluster --name rp-eu   --region eu-west-1 &
-wait
+# 3. Tear down infrastructure (VPCs, EKS, TGW, LB Controller, peer Services, IAM).
+cd terraform
+terraform destroy
 ```
 
-The IAM policy `AWSLoadBalancerControllerIAMPolicy-rpstretch` is account-global; delete it manually if you don't want it to linger:
-
-```bash
-aws iam delete-policy --policy-arn arn:aws:iam::<account>:policy/AWSLoadBalancerControllerIAMPolicy-rpstretch
-```
+If `terraform destroy` hangs on a TGW peering attachment, give it 2–3 minutes — peering deletion is async on the AWS side and Terraform will retry. If a destroy hangs on a VPC, an unmanaged ENI from a leftover NLB is usually the cause; check the AWS console for stranded ELBv2 resources tagged with the project name.
 
 ## Cost (running)
 

@@ -10,3 +10,17 @@ values-rp-eu.yaml
 *.log
 *.bak
 .DS_Store
+
+# Terraform local state and provider cache
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
