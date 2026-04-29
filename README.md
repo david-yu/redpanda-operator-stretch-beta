@@ -9,16 +9,16 @@ This repo captures the exact configs that brought a stretch cluster up green on 
 - [Repo layout](#repo-layout)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
-  - [Install the rpk-k8s plugin](#install-the-rpk-k8s-plugin)
 - [Step-by-step](#step-by-step)
   - [1. Provision infrastructure (Terraform)](#1-provision-infrastructure-terraform)
-  - [2. Bootstrap multicluster TLS + kubeconfig secrets](#2-bootstrap-multicluster-tls--kubeconfig-secrets)
-  - [3. License Secret + helm install](#3-license-secret--helm-install)
-  - [4. cert-manager per cluster](#4-cert-manager-per-cluster)
-  - [5. Apply StretchCluster + NodePools](#5-apply-stretchcluster--nodepools)
-  - [6. Wait for green](#6-wait-for-green)
-  - [7. Final state](#7-final-state)
-  - [8. Quick test — produce and consume across clusters](#8-quick-test--produce-and-consume-across-clusters)
+  - [2. Install the rpk-k8s plugin](#2-install-the-rpk-k8s-plugin)
+  - [3. Bootstrap multicluster TLS + kubeconfig secrets](#3-bootstrap-multicluster-tls--kubeconfig-secrets)
+  - [4. License Secret + helm install](#4-license-secret--helm-install)
+  - [5. cert-manager per cluster](#5-cert-manager-per-cluster)
+  - [6. Apply StretchCluster + NodePools](#6-apply-stretchcluster--nodepools)
+  - [7. Wait for green](#7-wait-for-green)
+  - [8. Final state](#8-final-state)
+  - [9. Quick test — produce and consume across clusters](#9-quick-test--produce-and-consume-across-clusters)
 - [Optional demos](#optional-demos)
   - [Demo A: ordered leader pinning + region-failover fallback](#demo-a-ordered-leader-pinning--region-failover-fallback)
   - [Demo B: ghost broker auto-decommission](#demo-b-ghost-broker-auto-decommission)
@@ -70,30 +70,18 @@ Two transports:
 | `terraform` | ≥ 1.6 |
 | `kubectl` | matches your K8s version (1.31 here) |
 | `helm` | ≥ 3.14 |
-| `rpk` | with the v26.2.1-beta.1 `rpk-k8s` plugin (see below) |
+| `rpk` | base CLI; the v26.2.1-beta.1 `rpk-k8s` plugin is installed in step 2 |
 | GCP only: `gke-gcloud-auth-plugin` | latest |
 
 Plus a **Redpanda Enterprise license** — required, not optional. The multicluster operator binary won't start without one (see [Troubleshooting](#troubleshooting) issue 1).
 
-### Install the `rpk-k8s` plugin
-
-```bash
-ARCH=darwin-arm64   # or linux-amd64, etc.
-curl -sSLO "https://github.com/redpanda-data/redpanda-operator/releases/download/operator/v26.2.1-beta.1/rpk-k8s-${ARCH}-v26.2.1-beta.1.tar.gz"
-tar -xzf "rpk-k8s-${ARCH}-v26.2.1-beta.1.tar.gz"
-mkdir -p "$HOME/.local/bin"
-install "rpk-k8s-${ARCH}" "$HOME/.local/bin/.rpk.ac-k8s"
-export PATH="$HOME/.local/bin:$PATH"
-rpk k8s multicluster --help
-```
-
 ## Step-by-step
 
-The flow: Terraform provisions infrastructure (step 1) → manual steps (2+) bootstrap multicluster, install the operator and StretchCluster. Steps 2 onward are cloud-agnostic — once the kubectl contexts `rp-east`, `rp-west`, `rp-eu` are registered, the same commands work on AWS, GCP, or Azure.
+The flow: Terraform provisions infrastructure (step 1) → install the rpk-k8s plugin (step 2) → manual steps (3+) bootstrap multicluster, install the operator and StretchCluster. Steps 2 onward are cloud-agnostic — once the kubectl contexts `rp-east`, `rp-west`, `rp-eu` are registered, the same commands work on AWS, GCP, or Azure.
 
 ### 1. Provision infrastructure (Terraform)
 
-Pick your cloud and follow the corresponding Terraform README — each handles VPCs/VNets, K8s clusters, cross-region networking, and pre-creates the peer LB Services for step 2:
+Pick your cloud and follow the corresponding Terraform README — each handles VPCs/VNets, K8s clusters, cross-region networking, and pre-creates the peer LB Services for step 3:
 
 | Cloud | Terraform | Networking model |
 |---|---|---|
@@ -129,7 +117,21 @@ terraform output peer_lb_addresses    # GCP/Azure (IPs) — or peer_lb_hostnames
 terraform output -raw kubectl_setup_commands   # for reference
 ```
 
-### 2. Bootstrap multicluster TLS + kubeconfig secrets
+### 2. Install the `rpk-k8s` plugin
+
+The multicluster bootstrap, status, and config are driven by `rpk k8s multicluster`, which lives in a versioned plugin shipped alongside each operator release. Install the plugin matching the operator version (`v26.2.1-beta.1`):
+
+```bash
+ARCH=darwin-arm64   # or linux-amd64, etc.
+curl -sSLO "https://github.com/redpanda-data/redpanda-operator/releases/download/operator/v26.2.1-beta.1/rpk-k8s-${ARCH}-v26.2.1-beta.1.tar.gz"
+tar -xzf "rpk-k8s-${ARCH}-v26.2.1-beta.1.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install "rpk-k8s-${ARCH}" "$HOME/.local/bin/.rpk.ac-k8s"
+export PATH="$HOME/.local/bin:$PATH"
+rpk k8s multicluster --help
+```
+
+### 3. Bootstrap multicluster TLS + kubeconfig secrets
 
 ```bash
 rpk k8s multicluster bootstrap \
@@ -159,7 +161,7 @@ done
 
 The example values use `<RP_EAST_API_SERVER>`, `<RP_EAST_NLB_HOSTNAME>`, etc. as placeholders — replace them with what `terraform output` emitted.
 
-### 3. License Secret + helm install
+### 4. License Secret + helm install
 
 The license itself is **never committed**. Place your license at a local path and create the Secret per cluster:
 
@@ -195,9 +197,9 @@ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu 
 
 You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, `UNHEALTHY=0`, and the four cross-cluster checks ✓.
 
-### 4. cert-manager per cluster
+### 5. cert-manager per cluster
 
-Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment. cert-manager is independent of steps 1–3 and can be installed any time before step 5 (in parallel if you want to save wall-clock time).
+Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment. cert-manager is independent of steps 1–4 and can be installed any time before step 6 (in parallel if you want to save wall-clock time).
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io --force-update && helm repo update
@@ -212,7 +214,7 @@ done
 wait
 ```
 
-### 5. Apply StretchCluster + NodePools
+### 6. Apply StretchCluster + NodePools
 
 (Terraform already annotates the default StorageClass on AWS — `gp2`. GKE and AKS ship a default already; no patch needed.)
 
@@ -234,7 +236,7 @@ kubectl --context rp-eu   -n redpanda apply -f manifests/nodepool-rp-eu.yaml
 
 The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). Both differ from the gist; see [Troubleshooting](#troubleshooting) issues 7–8.
 
-### 6. Wait for green
+### 7. Wait for green
 
 ```bash
 kubectl --context rp-east -n redpanda get stretchcluster redpanda \
@@ -243,7 +245,7 @@ kubectl --context rp-east -n redpanda get stretchcluster redpanda \
 
 Want to see all of: `Ready=True`, `Healthy=True`, `LicenseValid=True`, `ResourcesSynced=True`, `ConfigurationApplied=True`, `SpecSynced=True`. (`Stable` and `Quiesced` may report `False` for a few minutes after a config change — that's normal.)
 
-### 7. Final state
+### 8. Final state
 
 Two checks confirm the cluster is fully wired up — one for the operator/raft layer and one for the Redpanda data plane.
 
@@ -275,7 +277,7 @@ ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VER
 
 If `rpk multicluster status` looks healthy but `brokers list` doesn't show all the expected brokers, suspect a broker-network problem (firewall/SG missing port 33145, or `crossClusterMode` not set to `flat`); see [Troubleshooting](#troubleshooting) issues 7 and 10.
 
-### 8. Quick test — produce and consume across clusters
+### 9. Quick test — produce and consume across clusters
 
 Verify Kafka actually works end-to-end across the three clusters:
 
@@ -323,7 +325,7 @@ The committed defaults are:
 
 The autobalancer timeouts are tuned aggressively so the demos finish in 2–3 minutes. **Raise these substantially before using a stretch cluster in production** — a transient regional blip shouldn't trigger an automatic decommission.
 
-Run both demos after step 8 (Quick test) on a healthy cluster.
+Run both demos after step 9 (Quick test) on a healthy cluster.
 
 ### Demo A: ordered leader pinning + region-failover fallback
 
