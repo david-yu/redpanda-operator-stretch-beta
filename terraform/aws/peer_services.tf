@@ -9,9 +9,9 @@
 
 locals {
   peer_svc_annotations = {
-    "service.beta.kubernetes.io/aws-load-balancer-type"                            = "external"
-    "service.beta.kubernetes.io/aws-load-balancer-scheme"                          = "internal"
-    "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"                 = "ip"
+    "service.beta.kubernetes.io/aws-load-balancer-type"                              = "external"
+    "service.beta.kubernetes.io/aws-load-balancer-scheme"                            = "internal"
+    "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"                   = "ip"
     "service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled" = "true"
   }
 }
@@ -52,7 +52,10 @@ resource "kubernetes_service" "peer_east" {
     }
     publish_not_ready_addresses = true
   }
-  depends_on = [helm_release.lbc_east]
+  # Also depend on module.eks_east so destroy keeps the nodegroup alive until
+  # the peer Service finishes draining; otherwise the AWS LB Controller can't
+  # run to remove its finalizer and Terraform hangs on the Service deletion.
+  depends_on = [helm_release.lbc_east, module.eks_east]
 }
 
 resource "kubernetes_service" "peer_west" {
@@ -76,7 +79,7 @@ resource "kubernetes_service" "peer_west" {
     }
     publish_not_ready_addresses = true
   }
-  depends_on = [helm_release.lbc_west]
+  depends_on = [helm_release.lbc_west, module.eks_west]
 }
 
 resource "kubernetes_service" "peer_eu" {
@@ -100,7 +103,7 @@ resource "kubernetes_service" "peer_eu" {
     }
     publish_not_ready_addresses = true
   }
-  depends_on = [helm_release.lbc_eu]
+  depends_on = [helm_release.lbc_eu, module.eks_eu]
 }
 
 # Wait for each NLB hostname to materialize so outputs.tf can surface it.
