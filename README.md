@@ -242,6 +242,10 @@ Want to see all of: `Ready=True`, `Healthy=True`, `LicenseValid=True`, `Resource
 
 ### 7. Final state
 
+Two checks confirm the cluster is fully wired up — one for the operator/raft layer and one for the Redpanda data plane.
+
+**Operator + cross-cluster raft.** `rpk k8s multicluster status` connects to every operator pod (one per K8s cluster) over the bootstrap-managed mTLS, prints the raft role each one currently holds, and runs four cross-cluster sanity checks: that no two operators picked the same node name, that all operators agree on which peers exist, that they all agree on who the raft leader is at the same term, and that they all carry the same shared CA. A healthy install reports `OPERATOR=Running` everywhere, exactly one `StateLeader` and the rest `StateFollower`, `PEERS=3`, `UNHEALTHY=0`, `TLS=ok`, `SECRETS=ok`, and ✓ on all four cross-cluster checks:
+
 ```
 $ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu -n redpanda
 CLUSTER  OPERATOR  RAFT-STATE     LEADER  PEERS  UNHEALTHY  TLS  SECRETS
@@ -256,13 +260,17 @@ CROSS-CLUSTER:
   ✓ [ca-consistency] all clusters share the same CA
 ```
 
+**Broker membership.** Once raft is healthy, the brokers themselves should have formed a single Redpanda cluster spanning the three K8s clusters. `rpk redpanda admin brokers list` (run inside any broker pod via `kubectl exec`) hits the local broker's Admin API and dumps the cluster's authoritative broker list. The point of running it from one region and seeing brokers in *all* regions is to confirm broker-to-broker discovery worked: the in-pod DNS resolved peer pod names like `redpanda-rp-west-0.redpanda` to actual cross-cluster pod IPs (via the operator's flat-mode EndpointSlices), traffic on port 33145 flowed through the cloud's L3 path (TGW / VPC / VNet peering), and the brokers gossiped successfully. Every row should show `MEMBERSHIP=active` and `IS-ALIVE=true`:
+
 ```
 $ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- rpk redpanda admin brokers list
 ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VERSION
-0     redpanda-rp-east-0.redpanda  33145  -     1      active      true      25.3.14
-1     redpanda-rp-eu-0.redpanda    33145  -     1      active      true      25.3.14
-2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      25.3.14
+0     redpanda-rp-east-0.redpanda  33145  -     1      active      true      26.1.6
+1     redpanda-rp-eu-0.redpanda    33145  -     1      active      true      26.1.6
+2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      26.1.6
 ```
+
+If `rpk multicluster status` looks healthy but `brokers list` doesn't show all the expected brokers, suspect a broker-network problem (firewall/SG missing port 33145, or `crossClusterMode` not set to `flat`); see [Troubleshooting](#troubleshooting) issues 7 and 10.
 
 ### 8. Quick test — produce and consume across clusters
 
