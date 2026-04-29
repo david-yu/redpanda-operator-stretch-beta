@@ -1,0 +1,12 @@
+# Never commit licenses, kubeconfigs, or rendered values with real endpoints/LB hostnames.
+*.license
+*.key
+kubeconfig*
+values-rp-east.yaml
+values-rp-west.yaml
+values-rp-eu.yaml
+
+# Local logs / scratch
+*.log
+*.bak
+.DS_Store

@@ -1,0 +1,21 @@
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: StretchCluster
+metadata:
+  name: redpanda
+  namespace: redpanda
+spec:
+  rbac:
+    enabled: true
+  external:
+    enabled: false
+  networking:
+    crossClusterMode: flat
+  tls:
+    enabled: true
+    certs:
+      default:
+        caEnabled: true
+  enterprise:
+    licenseSecretRef:
+      name: redpanda-license
+      key: license.key

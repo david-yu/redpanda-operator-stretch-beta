@@ -1,0 +1,48 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: rp-eu
+  region: eu-west-1
+  version: "1.31"
+  tags:
+    Project: redpanda-stretch-validation
+    Owner: david.yu@redpanda.com
+    CreatedBy: claude-code
+    Purpose: operator-v26.2.1-beta.1-validation
+
+vpc:
+  cidr: 10.30.0.0/16
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+iam:
+  withOIDC: true
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: aws-ebs-csi-driver
+    wellKnownPolicies:
+      ebsCSIController: true
+
+managedNodeGroups:
+  - name: ng-default
+    instanceType: m5.xlarge
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 3
+    volumeSize: 50
+    privateNetworking: false
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+        ebs: true
+        externalDNS: false
+        certManager: false
+    labels:
+      role: worker
+    tags:
+      Project: redpanda-stretch-validation
