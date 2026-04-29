@@ -6,7 +6,6 @@ This repo captures the exact configs that brought a stretch cluster up green on 
 
 ## Table of contents
 
-- [Final state](#final-state)
 - [Repo layout](#repo-layout)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
@@ -18,35 +17,12 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [4. cert-manager per cluster](#4-cert-manager-per-cluster)
   - [5. Apply StretchCluster + NodePools](#5-apply-stretchcluster--nodepools)
   - [6. Wait for green](#6-wait-for-green)
+- [Final state](#final-state)
 - [Quick test — produce and consume across clusters](#quick-test--produce-and-consume-across-clusters)
 - [Tear down](#tear-down)
 - [Troubleshooting](#troubleshooting)
 - [Cost (running)](#cost-running)
 - [Source](#source)
-
-## Final state
-
-```
-$ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu -n redpanda
-CLUSTER  OPERATOR  RAFT-STATE     LEADER  PEERS  UNHEALTHY  TLS  SECRETS
-rp-east  Running   StateFollower  rp-eu   3      0          ok   ok
-rp-west  Running   StateFollower  rp-eu   3      0          ok   ok
-rp-eu    Running   StateLeader    rp-eu   3      0          ok   ok
-
-CROSS-CLUSTER:
-  ✓ [unique-names] all node names are unique
-  ✓ [peer-agreement] peer lists agree across all clusters
-  ✓ [leader-agreement] leader agreement: rp-eu (term 2)
-  ✓ [ca-consistency] all clusters share the same CA
-```
-
-```
-$ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- rpk redpanda admin brokers list
-ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VERSION
-0     redpanda-rp-east-0.redpanda  33145  -     1      active      true      25.3.14
-1     redpanda-rp-eu-0.redpanda    33145  -     1      active      true      25.3.14
-2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      25.3.14
-```
 
 ## Repo layout
 
@@ -263,6 +239,30 @@ kubectl --context rp-east -n redpanda get stretchcluster redpanda \
 ```
 
 Want to see all of: `Ready=True`, `Healthy=True`, `LicenseValid=True`, `ResourcesSynced=True`, `ConfigurationApplied=True`, `SpecSynced=True`. (`Stable` and `Quiesced` may report `False` for a few minutes after a config change — that's normal.)
+
+## Final state
+
+```
+$ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu -n redpanda
+CLUSTER  OPERATOR  RAFT-STATE     LEADER  PEERS  UNHEALTHY  TLS  SECRETS
+rp-east  Running   StateFollower  rp-eu   3      0          ok   ok
+rp-west  Running   StateFollower  rp-eu   3      0          ok   ok
+rp-eu    Running   StateLeader    rp-eu   3      0          ok   ok
+
+CROSS-CLUSTER:
+  ✓ [unique-names] all node names are unique
+  ✓ [peer-agreement] peer lists agree across all clusters
+  ✓ [leader-agreement] leader agreement: rp-eu (term 2)
+  ✓ [ca-consistency] all clusters share the same CA
+```
+
+```
+$ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- rpk redpanda admin brokers list
+ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VERSION
+0     redpanda-rp-east-0.redpanda  33145  -     1      active      true      25.3.14
+1     redpanda-rp-eu-0.redpanda    33145  -     1      active      true      25.3.14
+2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      25.3.14
+```
 
 ## Quick test — produce and consume across clusters
 
