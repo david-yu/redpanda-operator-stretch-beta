@@ -334,7 +334,17 @@ Each broker reads the K8s node's `topology.kubernetes.io/region` label and uses 
 ```bash
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk redpanda admin brokers list
-# RACK column should show us-east-1, us-west-2, or eu-west-1 per broker.
+```
+
+Expected output — every broker has a `RACK` value matching its region:
+
+```
+ID    HOST                         PORT   RACK       CORES  MEMBERSHIP  IS-ALIVE  VERSION
+0     redpanda-rp-east-0.redpanda  33145  us-east-1  1      active      true      26.1.6
+1     redpanda-rp-east-1.redpanda  33145  us-east-1  1      active      true      26.1.6
+2     redpanda-rp-eu-0.redpanda    33145  eu-west-1  1      active      true      26.1.6
+3     redpanda-rp-west-0.redpanda  33145  us-west-2  1      active      true      26.1.6
+4     redpanda-rp-west-1.redpanda  33145  us-west-2  1      active      true      26.1.6
 ```
 
 For a clean demo, lower the autobalancer timeouts (the cluster takes 30s to mark a missing broker unavailable, default is 5m):
@@ -346,35 +356,112 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- b
 '
 ```
 
+```
+Successfully updated configuration. New configuration version is N.
+Successfully updated configuration. New configuration version is N+1.
+```
+
 **Show preference 1 working** — create a topic with 12 partitions and watch leadership concentrate on `us-east-1` brokers:
 
 ```bash
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk topic create leader-pinning-demo --partitions 12 --replicas 5
+```
+
+```
+TOPIC                STATUS
+leader-pinning-demo  OK
+```
+
+```bash
 sleep 60   # let the leader balancer converge
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
-  rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
-# Expect: all 12 leaders on the two us-east-1 brokers (IDs 0 and 1).
+  rpk topic describe leader-pinning-demo -p
 ```
+
+Expected partition table — every replica list contains all 5 brokers (RF=5), and every leader is broker 0 or 1:
+
+```
+PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
+0          0       2      [0 1 2 3 4]  0                 0
+1          0       1      [0 1 2 3 4]  0                 0
+2          0       2      [0 1 2 3 4]  0                 0
+3          0       2      [0 1 2 3 4]  0                 0
+4          1       2      [0 1 2 3 4]  0                 0
+5          1       2      [0 1 2 3 4]  0                 0
+6          1       2      [0 1 2 3 4]  0                 0
+7          0       1      [0 1 2 3 4]  0                 0
+8          0       2      [0 1 2 3 4]  0                 0
+9          1       1      [0 1 2 3 4]  0                 0
+10         1       2      [0 1 2 3 4]  0                 0
+11         1       1      [0 1 2 3 4]  0                 0
+```
+
+A leader-by-broker tally makes the pattern obvious:
+
+```bash
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+  rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
+```
+
+```
+   6 0
+   6 1
+```
+
+— all 12 leaders on the two `us-east-1` brokers (preference 1), evenly split.
 
 **Show fallback when us-east-1 goes down** — scale the rp-east StatefulSet to 0:
 
 ```bash
 kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
+```
 
-# Wait ~60s for brokers to terminate and the leader balancer to react.
-sleep 60
+```
+statefulset.apps/redpanda-rp-east scaled
+```
+
+```bash
+# Wait ~90s for brokers to terminate, partitions to re-replicate, and the
+# leader balancer to converge on the next-priority rack.
+sleep 90
 
 kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
   rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
-# Leaders should migrate off brokers 0+1 to brokers 3+4 (us-west-2 — preference 2).
 ```
+
+Expected — leaders migrate off brokers 0+1 to brokers 3+4 (`us-west-2`, preference 2):
+
+```
+   6 3
+   6 4
+```
+
+If during a transition you see something like:
+
+```
+   4 2
+   4 3
+   4 4
+```
+
+that's the leader balancer mid-convergence — broker 2 (`eu-west-1`, preference 3) was used as a temporary holder for partitions whose preferred replicas were not yet caught up. Wait another 30–60s and re-tally; leadership consolidates on `us-west-2` once partitions are re-replicated there.
 
 **Restore us-east-1**:
 
 ```bash
 kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
-sleep 90   # brokers come back, leaders move back to us-east-1
+```
+
+```
+statefulset.apps/redpanda-rp-east scaled
+```
+
+```bash
+# Brokers rejoin (~60s), partitions catch up, leader balancer moves leaders
+# back to us-east-1 (preference 1). Expect:
+#    6 0
+#    6 1
 ```
 
 A few caveats observed during validation:
@@ -395,6 +482,11 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- b
 '
 ```
 
+```
+Successfully updated configuration. New configuration version is N.
+Successfully updated configuration. New configuration version is N+1.
+```
+
 **Permanently kill one broker** (delete its pod AND its PVC so it can't come back with the same identity):
 
 ```bash
@@ -402,7 +494,12 @@ kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=1
 kubectl --context rp-east -n redpanda delete pvc datadir-redpanda-rp-east-1
 ```
 
-**Wait and watch the broker count drop from 5 to 4**:
+```
+statefulset.apps/redpanda-rp-east scaled
+persistentvolumeclaim "datadir-redpanda-rp-east-1" deleted
+```
+
+**Wait and watch broker 1 transition through `active → draining → (gone)`**:
 
 ```bash
 for i in $(seq 1 20); do
@@ -413,7 +510,52 @@ for i in $(seq 1 20); do
 done
 ```
 
-You should see broker 1 transition `active → draining → (gone from list)` over ~2-3 minutes. The partition autobalancer also redistributes the partitions broker 1 used to host onto the remaining brokers — `rpk topic describe -p` will show fewer `1` entries in the `REPLICAS` column.
+Expected progression of the `ID  MEMBERSHIP  IS-ALIVE` columns over ~3 minutes (`/i:` annotations added for clarity):
+
+```
+--- T+0:00 ---           # broker 1 just removed; still in roster, marked alive
+0 active true
+1 active true
+2 active true
+3 active true
+4 active true
+
+--- T+0:30 ---           # availability_timeout (30s) elapsed → broker 1 marked dead
+0 active true
+1 active false
+2 active true
+3 active true
+4 active true
+
+--- T+1:30 ---           # autodecommission_timeout (60s) elapsed → autobalancer
+0 active true            # starts draining broker 1's replicas onto others
+1 draining false
+2 active true
+3 active true
+4 active true
+
+--- T+3:00 ---           # drain complete; broker 1 evicted from the list
+0 active true
+2 active true
+3 active true
+4 active true
+```
+
+Confirm with the partition layout — broker 1 should no longer appear in any `REPLICAS` column:
+
+```bash
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+  rpk topic describe leader-pinning-demo -p
+```
+
+```
+PARTITION  LEADER  EPOCH  REPLICAS   LOG-START-OFFSET  HIGH-WATERMARK
+0          0       3      [0 2 3 4]  0                 0
+1          0       3      [0 2 3 4]  0                 0
+...
+```
+
+(All 12 partitions now have RF=4 over brokers `[0 2 3 4]` — the `1` is gone from every replica set, and the cluster's effective replica budget is one broker smaller than before.)
 
 **Important caveats observed during validation** that may differ from documentation:
 
