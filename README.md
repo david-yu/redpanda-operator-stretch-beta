@@ -17,8 +17,8 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [4. cert-manager per cluster](#4-cert-manager-per-cluster)
   - [5. Apply StretchCluster + NodePools](#5-apply-stretchcluster--nodepools)
   - [6. Wait for green](#6-wait-for-green)
-- [Final state](#final-state)
-- [Quick test — produce and consume across clusters](#quick-test--produce-and-consume-across-clusters)
+  - [7. Final state](#7-final-state)
+  - [8. Quick test — produce and consume across clusters](#8-quick-test--produce-and-consume-across-clusters)
 - [Tear down](#tear-down)
 - [Troubleshooting](#troubleshooting)
 - [Cost (running)](#cost-running)
@@ -240,7 +240,7 @@ kubectl --context rp-east -n redpanda get stretchcluster redpanda \
 
 Want to see all of: `Ready=True`, `Healthy=True`, `LicenseValid=True`, `ResourcesSynced=True`, `ConfigurationApplied=True`, `SpecSynced=True`. (`Stable` and `Quiesced` may report `False` for a few minutes after a config change — that's normal.)
 
-## Final state
+### 7. Final state
 
 ```
 $ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu -n redpanda
@@ -264,7 +264,7 @@ ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VER
 2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      25.3.14
 ```
 
-## Quick test — produce and consume across clusters
+### 8. Quick test — produce and consume across clusters
 
 Verify Kafka actually works end-to-end across the three clusters:
 
