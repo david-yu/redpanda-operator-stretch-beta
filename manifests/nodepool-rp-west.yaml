@@ -8,7 +8,7 @@ spec:
     group: cluster.redpanda.com
     kind: StretchCluster
     name: redpanda
-  replicas: 1
+  replicas: 2
   image:
     repository: redpandadata/redpanda
     tag: v25.3.14
