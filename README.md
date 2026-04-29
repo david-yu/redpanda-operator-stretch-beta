@@ -2,7 +2,9 @@
 
 A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`, validated on AWS EKS in `us-east-1`, `us-west-2`, and `eu-west-1`, peered via Transit Gateway.
 
-This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. It deviates from the [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) in several places — see [Differences from the gist](#differences-from-the-gist) and [Troubleshooting](#troubleshooting).
+This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference; this repo's `manifests/` and `helm-values/` reflect the values that actually work — see [Troubleshooting](#troubleshooting) for the why behind each one.
+
+> **Coming soon:** GCP (GKE) example configs and a Terraform module for provisioning the Kubernetes clusters + cross-region networking. The current AWS flow uses `eksctl` + a shell script for TGW setup; these will be replaced with reproducible Terraform that also covers GKE + VPC Network Peering / Network Connectivity Center.
 
 ## Final state
 
@@ -354,23 +356,6 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
 ```
 
 If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection refused`, jump to issue 10 below — it's almost always a missing SG rule.
-
-## Differences from the gist
-
-The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference but several of its concrete examples don't work as-is. This repo:
-
-| Gist | Reality | Fix in this repo |
-|---|---|---|
-| License "optional with trial" | Multicluster operator binary fails on empty `--license-file-path` | Real enterprise license required; manifests/values reference `redpanda-license` Secret |
-| Operator gRPC port `8443` | Actual port is `9443` (`PeerLoadBalancerPort`) | SG rules and `setup-tgw.sh` open `9443` |
-| `rpk k8s multicluster bootstrap --loadbalancer` "with same annotations" | Bootstrap CLI doesn't pass annotations to `PeerLoadBalancerConfig` | Pre-create Service with annotations, bootstrap reuses it |
-| `--name-override <ctx>=<release>` | Collides peer names — raft can't disambiguate `--peer=<same>://*` | Helm release name = context name, no `--name-override` needed |
-| `multicluster.apiServerExternalAddress` not shown | Required — chart fails template rendering otherwise | Included in example values |
-| cert-manager "optional" | Required when `tls.enabled: true` | Step 4 above |
-| StretchCluster spec missing `networking.crossClusterMode` | Defaults to `mesh` (needs Cilium); brokers can't resolve peers via short DNS | `crossClusterMode: flat` set in `stretchcluster.yaml` |
-| NodePool `services.perPod.remote.enabled: false` | Operator skips per-pool Services for remote pools, EndpointSlices orphaned | `enabled: true` in all `nodepool-*.yaml` |
-| EKS `gp2` is default StorageClass | Newer EKS doesn't annotate it default | Step 8 patches `is-default-class=true` |
-| AWS section only opens broker RPC `33145` | Kafka `9093`, Pandaproxy `8082`, Admin `9644` also need cross-cluster ingress for `rpk` clients | `setup-tgw.sh` opens all five ports |
 
 ## Troubleshooting
 
