@@ -179,24 +179,7 @@ done
 wait
 ```
 
-### 4. cert-manager per cluster
-
-Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment.
-
-```bash
-helm repo add jetstack https://charts.jetstack.io --force-update && helm repo update
-
-for C in rp-east rp-west rp-eu; do
-  helm --kube-context "$C" upgrade --install cert-manager jetstack/cert-manager \
-    --namespace cert-manager --create-namespace \
-    --version v1.17.2 \
-    --set crds.enabled=true \
-    --wait --timeout 5m &
-done
-wait
-```
-
-### 5. Pre-create peer LB Services (with NLB-internal annotations)
+### 4. Pre-create peer LB Services (with NLB-internal annotations)
 
 The `rpk k8s multicluster bootstrap` CLI doesn't expose an annotations flag, so a default `--loadbalancer` run produces a Classic ELB internet-facing LB. Pre-creating the Service first and letting bootstrap reuse it (via `controllerutil.CreateOrUpdate`) is how you get a proper internal NLB:
 
@@ -215,7 +198,7 @@ for C in rp-east rp-west rp-eu; do
 done
 ```
 
-### 6. Bootstrap multicluster TLS + kubeconfig secrets
+### 5. Bootstrap multicluster TLS + kubeconfig secrets
 
 ```bash
 rpk k8s multicluster bootstrap \
@@ -249,7 +232,7 @@ for C in rp-east rp-west rp-eu; do
 done
 ```
 
-### 7. License Secret + helm install
+### 6. License Secret + helm install
 
 The license itself is **never committed**. Place your license at a local path and create the Secret per cluster:
 
@@ -284,6 +267,23 @@ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu 
 ```
 
 You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, `UNHEALTHY=0`, and the four cross-cluster checks ✓.
+
+### 7. cert-manager per cluster
+
+Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment. cert-manager is independent of steps 3–6 and can be installed any time before step 8 (in parallel with the others if you want to save wall-clock time).
+
+```bash
+helm repo add jetstack https://charts.jetstack.io --force-update && helm repo update
+
+for C in rp-east rp-west rp-eu; do
+  helm --kube-context "$C" upgrade --install cert-manager jetstack/cert-manager \
+    --namespace cert-manager --create-namespace \
+    --version v1.17.2 \
+    --set crds.enabled=true \
+    --wait --timeout 5m &
+done
+wait
+```
 
 ### 8. Apply StretchCluster + NodePools
 
