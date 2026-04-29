@@ -19,6 +19,9 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [6. Wait for green](#6-wait-for-green)
   - [7. Final state](#7-final-state)
   - [8. Quick test — produce and consume across clusters](#8-quick-test--produce-and-consume-across-clusters)
+- [Optional demos](#optional-demos)
+  - [Demo A: ordered leader pinning + region-failover fallback](#demo-a-ordered-leader-pinning--region-failover-fallback)
+  - [Demo B: ghost broker auto-decommission](#demo-b-ghost-broker-auto-decommission)
 - [Tear down](#tear-down)
 - [Troubleshooting](#troubleshooting)
 - [Cost (running)](#cost-running)
@@ -305,6 +308,119 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
 ```
 
 If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection refused`, jump to issue 10 below — it's almost always a missing firewall/SG rule.
+
+## Optional demos
+
+The default `stretchcluster.yaml` enables two stretch-cluster-specific features that aren't on by default in the gist's spec: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). The two demos below show both end-to-end. Run them after step 8 (Quick test) on a healthy cluster.
+
+### Demo A: ordered leader pinning + region-failover fallback
+
+The committed `stretchcluster.yaml` configures:
+
+```yaml
+rackAwareness:
+  enabled: true
+  nodeAnnotation: topology.kubernetes.io/region   # rack = AWS region
+
+config:
+  cluster:
+    # Ordered preference: prefer us-east-1; if it's unavailable, fall back
+    # to us-west-2; only use eu-west-1 if both US regions are gone.
+    default_leaders_preference: "racks:us-east-1,us-west-2,eu-west-1"
+```
+
+Each broker reads the K8s node's `topology.kubernetes.io/region` label and uses it as its rack — so brokers end up in racks `us-east-1`, `us-west-2`, `eu-west-1` (one rack per region). Verify:
+
+```bash
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+  rpk redpanda admin brokers list
+# RACK column should show us-east-1, us-west-2, or eu-west-1 per broker.
+```
+
+For a clean demo, lower the autobalancer timeouts (the cluster takes 30s to mark a missing broker unavailable, default is 5m):
+
+```bash
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- bash -c '
+  rpk cluster config set partition_autobalancing_node_availability_timeout_sec 30
+  rpk cluster config set partition_autobalancing_node_autodecommission_timeout_sec 60
+'
+```
+
+**Show preference 1 working** — create a topic with 12 partitions and watch leadership concentrate on `us-east-1` brokers:
+
+```bash
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+  rpk topic create leader-pinning-demo --partitions 12 --replicas 5
+sleep 60   # let the leader balancer converge
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+  rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
+# Expect: all 12 leaders on the two us-east-1 brokers (IDs 0 and 1).
+```
+
+**Show fallback when us-east-1 goes down** — scale the rp-east StatefulSet to 0:
+
+```bash
+kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
+
+# Wait ~60s for brokers to terminate and the leader balancer to react.
+sleep 60
+
+kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
+  rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
+# Leaders should migrate off brokers 0+1 to brokers 3+4 (us-west-2 — preference 2).
+```
+
+**Restore us-east-1**:
+
+```bash
+kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
+sleep 90   # brokers come back, leaders move back to us-east-1
+```
+
+A few caveats observed during validation:
+
+- The leader balancer **stalls during under-replicated periods** — when half a region's brokers go away, it pauses while the cluster is recovering, then resumes once partitions are re-replicated. Expect 30–90s of "leaders not yet on us-west-2" while replicas are being rebuilt elsewhere.
+- Cross-region heartbeats can flap during transitions — `rpk redpanda admin brokers list` may briefly show un-affected brokers as `IS-ALIVE=false`. Confirm against `rpk cluster health` (`Nodes down:` field) which uses the controller's authoritative view.
+
+### Demo B: ghost broker auto-decommission
+
+When a broker is permanently gone for longer than `partition_autobalancing_node_autodecommission_timeout_sec`, the partition autobalancer should automatically issue a decommission for it — the broker leaves the cluster, replicas redistribute, and the membership shrinks.
+
+**Lower the timeouts so the demo finishes in minutes, not hours**:
+
+```bash
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- bash -c '
+  rpk cluster config set partition_autobalancing_node_availability_timeout_sec 30
+  rpk cluster config set partition_autobalancing_node_autodecommission_timeout_sec 60
+'
+```
+
+**Permanently kill one broker** (delete its pod AND its PVC so it can't come back with the same identity):
+
+```bash
+kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=1
+kubectl --context rp-east -n redpanda delete pvc datadir-redpanda-rp-east-1
+```
+
+**Wait and watch the broker count drop from 5 to 4**:
+
+```bash
+for i in $(seq 1 20); do
+  echo "--- $(date +%T) ---"
+  kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+    rpk redpanda admin brokers list 2>/dev/null | awk 'NR>1 {print $1, $6, $7}'
+  sleep 30
+done
+```
+
+You should see broker 1 transition `active → draining → (gone from list)` over ~2-3 minutes. The partition autobalancer also redistributes the partitions broker 1 used to host onto the remaining brokers — `rpk topic describe -p` will show fewer `1` entries in the `REPLICAS` column.
+
+**Important caveats observed during validation** that may differ from documentation:
+
+- **Auto-decom requires the autobalancer to have a healthy view of the cluster.** The autobalancer's `status` field (visible at `https://<broker>:9644/v1/cluster/partition_balancer/status`) shows `stalled` when too many brokers appear unavailable. Cross-region heartbeat flapping during a regional outage can stall it indefinitely. If you see `"status": "stalled"` and the broker isn't being decommissioned, fall back to a manual decommission: `rpk redpanda admin brokers decommission <id> --skip-liveness-check`.
+- **The operator reverts cluster config from the StretchCluster spec on every reconcile.** If you `rpk cluster config set partition_autobalancing_node_autodecommission_timeout_sec 60` for the demo, but `spec.config.cluster.partition_autobalancing_node_autodecommission_timeout_sec: 600` is in the YAML, the operator will eventually push 600 back. Either edit the StretchCluster YAML for the demo period or accept that the override is temporary.
+
+After either demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replicated partitions) and that the `multicluster.peers`/raft layer is still intact via `rpk k8s multicluster status`.
 
 ## Tear down
 

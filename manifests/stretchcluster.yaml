@@ -10,6 +10,13 @@ spec:
     enabled: false
   networking:
     crossClusterMode: flat
+  # Rack awareness: each broker reads the K8s node's `topology.kubernetes.io/region`
+  # label and uses it as its rack. With the three-region EKS layout that gives
+  # racks of "us-east-1", "us-west-2", "eu-west-1" — the natural failure domain
+  # for a stretch cluster.
+  rackAwareness:
+    enabled: true
+    nodeAnnotation: topology.kubernetes.io/region
   tls:
     enabled: true
     certs:
@@ -19,3 +26,17 @@ spec:
     licenseSecretRef:
       name: redpanda-license
       key: license.key
+  # Cluster-level Redpanda config. spec.config.cluster is an open map
+  # (x-kubernetes-preserve-unknown-fields) that flows directly into the
+  # broker's bootstrap.yaml.
+  config:
+    cluster:
+      # Ordered leader pinning. With racks set to region (above), this tells
+      # Redpanda to prefer placing partition leaders in us-east-1; if no
+      # us-east-1 broker is available the leader balancer falls back to the
+      # next available rack.
+      default_leaders_preference: "racks:us-east-1"
+      # Ghost broker ejection. A broker that's been unreachable for this many
+      # seconds gets automatically decommissioned by the partition autobalancer.
+      # 600s = 10 minutes; tune lower for a faster demo, higher for production.
+      partition_autobalancing_node_autodecommission_timeout_sec: 600
