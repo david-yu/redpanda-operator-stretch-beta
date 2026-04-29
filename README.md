@@ -311,7 +311,19 @@ If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection re
 
 ## Optional demos
 
-The default `stretchcluster.yaml` enables two stretch-cluster-specific features that aren't on by default in the gist's spec: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). The two demos below show both end-to-end. Run them after step 8 (Quick test) on a healthy cluster.
+The default `stretchcluster.yaml` enables two stretch-cluster-specific features that aren't on by default in the gist's spec: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `manifests/stretchcluster.yaml` and applied at deploy time.
+
+The committed defaults are:
+
+| Key | Value | Why |
+|---|---|---|
+| `default_leaders_preference` | `racks:us-east-1,us-west-2,eu-west-1` | Ordered leader pinning. |
+| `partition_autobalancing_node_availability_timeout_sec` | `30` | Demo-fast (default 900s). |
+| `partition_autobalancing_node_autodecommission_timeout_sec` | `60` | Demo-fast (default 600s). |
+
+The autobalancer timeouts are tuned aggressively so the demos finish in 2–3 minutes. **Raise these substantially before using a stretch cluster in production** — a transient regional blip shouldn't trigger an automatic decommission.
+
+Run both demos after step 8 (Quick test) on a healthy cluster.
 
 ### Demo A: ordered leader pinning + region-failover fallback
 
@@ -345,20 +357,6 @@ ID    HOST                         PORT   RACK       CORES  MEMBERSHIP  IS-ALIVE
 2     redpanda-rp-eu-0.redpanda    33145  eu-west-1  1      active      true      26.1.6
 3     redpanda-rp-west-0.redpanda  33145  us-west-2  1      active      true      26.1.6
 4     redpanda-rp-west-1.redpanda  33145  us-west-2  1      active      true      26.1.6
-```
-
-For a clean demo, lower the autobalancer timeouts (the cluster takes 30s to mark a missing broker unavailable, default is 5m):
-
-```bash
-kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- bash -c '
-  rpk cluster config set partition_autobalancing_node_availability_timeout_sec 30
-  rpk cluster config set partition_autobalancing_node_autodecommission_timeout_sec 60
-'
-```
-
-```
-Successfully updated configuration. New configuration version is N.
-Successfully updated configuration. New configuration version is N+1.
 ```
 
 **Show preference 1 working** — create a topic with 12 partitions and watch leadership concentrate on `us-east-1` brokers:
@@ -471,21 +469,7 @@ A few caveats observed during validation:
 
 ### Demo B: ghost broker auto-decommission
 
-When a broker is permanently gone for longer than `partition_autobalancing_node_autodecommission_timeout_sec`, the partition autobalancer should automatically issue a decommission for it — the broker leaves the cluster, replicas redistribute, and the membership shrinks.
-
-**Lower the timeouts so the demo finishes in minutes, not hours**:
-
-```bash
-kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- bash -c '
-  rpk cluster config set partition_autobalancing_node_availability_timeout_sec 30
-  rpk cluster config set partition_autobalancing_node_autodecommission_timeout_sec 60
-'
-```
-
-```
-Successfully updated configuration. New configuration version is N.
-Successfully updated configuration. New configuration version is N+1.
-```
+When a broker is permanently gone for longer than `partition_autobalancing_node_autodecommission_timeout_sec`, the partition autobalancer should automatically issue a decommission for it — the broker leaves the cluster, replicas redistribute, and the membership shrinks. The relevant timeouts (`partition_autobalancing_node_availability_timeout_sec: 30`, `partition_autobalancing_node_autodecommission_timeout_sec: 60`) are already in `manifests/stretchcluster.yaml`, so the demo runs as-is.
 
 **Permanently kill one broker** (delete its pod AND its PVC so it can't come back with the same identity):
 
@@ -560,7 +544,7 @@ PARTITION  LEADER  EPOCH  REPLICAS   LOG-START-OFFSET  HIGH-WATERMARK
 **Important caveats observed during validation** that may differ from documentation:
 
 - **Auto-decom requires the autobalancer to have a healthy view of the cluster.** The autobalancer's `status` field (visible at `https://<broker>:9644/v1/cluster/partition_balancer/status`) shows `stalled` when too many brokers appear unavailable. Cross-region heartbeat flapping during a regional outage can stall it indefinitely. If you see `"status": "stalled"` and the broker isn't being decommissioned, fall back to a manual decommission: `rpk redpanda admin brokers decommission <id> --skip-liveness-check`.
-- **The operator reverts cluster config from the StretchCluster spec on every reconcile.** If you `rpk cluster config set partition_autobalancing_node_autodecommission_timeout_sec 60` for the demo, but `spec.config.cluster.partition_autobalancing_node_autodecommission_timeout_sec: 600` is in the YAML, the operator will eventually push 600 back. Either edit the StretchCluster YAML for the demo period or accept that the override is temporary.
+- **The operator reverts cluster config from the StretchCluster spec on every reconcile.** Any `rpk cluster config set` against keys that are also in `spec.config.cluster` will be undone on the next reconcile pass. If you want a different timeout for a one-off demo, edit `manifests/stretchcluster.yaml` and re-apply rather than setting it via rpk.
 
 After either demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replicated partitions) and that the `multicluster.peers`/raft layer is still intact via `rpk k8s multicluster status`.
 

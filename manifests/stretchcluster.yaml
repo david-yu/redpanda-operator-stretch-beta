@@ -29,14 +29,22 @@ spec:
   # Cluster-level Redpanda config. spec.config.cluster is an open map
   # (x-kubernetes-preserve-unknown-fields) that flows directly into the
   # broker's bootstrap.yaml.
+  #
+  # The values below are tuned for demo / validation:
+  #   - leader pinning prefers us-east-1, falls back to us-west-2, then eu-west-1
+  #   - autobalancer evicts a permanently-gone broker after ~60s
+  # For production, raise the autobalancer timeouts substantially (Redpanda's
+  # defaults are 900s / 600s) so a transient outage doesn't trigger a decommission.
   config:
     cluster:
-      # Ordered leader pinning. With racks set to region (above), this tells
-      # Redpanda to prefer placing partition leaders in us-east-1; if no
-      # us-east-1 broker is available the leader balancer falls back to the
-      # next available rack.
-      default_leaders_preference: "racks:us-east-1"
-      # Ghost broker ejection. A broker that's been unreachable for this many
-      # seconds gets automatically decommissioned by the partition autobalancer.
-      # 600s = 10 minutes; tune lower for a faster demo, higher for production.
-      partition_autobalancing_node_autodecommission_timeout_sec: 600
+      # Ordered leader pinning. The leader balancer places partition leaders in
+      # the FIRST listed rack with available brokers; if every broker in that
+      # rack is unreachable, it falls through to the next rack, and so on.
+      default_leaders_preference: "racks:us-east-1,us-west-2,eu-west-1"
+      # Time a broker can be unreachable before it's marked unavailable for
+      # partition movement. Demo value (default: 900). Raise for production.
+      partition_autobalancing_node_availability_timeout_sec: 30
+      # Time a broker can stay unavailable before the autobalancer issues a
+      # decommission for it. Must be > the availability timeout above. Demo
+      # value (default: 600). Raise for production.
+      partition_autobalancing_node_autodecommission_timeout_sec: 60
