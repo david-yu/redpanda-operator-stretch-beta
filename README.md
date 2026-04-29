@@ -17,7 +17,7 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [5. cert-manager per cluster](#5-cert-manager-per-cluster)
   - [6. Apply StretchCluster + NodePools](#6-apply-stretchcluster--nodepools)
   - [7. Wait for green](#7-wait-for-green)
-  - [8. Final state](#8-final-state)
+  - [8. Validate stretch cluster health using rpk k8s multicluster](#8-validate-stretch-cluster-health-using-rpk-k8s-multicluster)
   - [9. Quick test — produce and consume across clusters](#9-quick-test--produce-and-consume-across-clusters)
 - [Optional demos](#optional-demos)
   - [Demo A: ordered leader pinning + region-failover fallback](#demo-a-ordered-leader-pinning--region-failover-fallback)
@@ -245,7 +245,7 @@ kubectl --context rp-east -n redpanda get stretchcluster redpanda \
 
 Want to see all of: `Ready=True`, `Healthy=True`, `LicenseValid=True`, `ResourcesSynced=True`, `ConfigurationApplied=True`, `SpecSynced=True`. (`Stable` and `Quiesced` may report `False` for a few minutes after a config change — that's normal.)
 
-### 8. Final state
+### 8. Validate stretch cluster health using `rpk k8s multicluster`
 
 Two checks confirm the cluster is fully wired up — one for the operator/raft layer and one for the Redpanda data plane.
 
