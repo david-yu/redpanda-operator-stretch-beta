@@ -120,45 +120,11 @@ resource "aws_ec2_transit_gateway_peering_attachment_accepter" "west_eu" {
   tags = { Name = "rp-west-to-rp-eu" }
 }
 
-# TGW route table — associate each peering attachment with the default RT
-# (peerings aren't auto-associated even when default_route_table_association
-# is enabled — that flag only applies to VPC attachments).
-
-resource "aws_ec2_transit_gateway_route_table_association" "east_west" {
-  provider                       = aws.east
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_peering_attachment_accepter.east_west.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway.east.association_default_route_table_id
-}
-
-resource "aws_ec2_transit_gateway_route_table_association" "east_eu" {
-  provider                       = aws.east
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_peering_attachment_accepter.east_eu.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway.east.association_default_route_table_id
-}
-
-resource "aws_ec2_transit_gateway_route_table_association" "west_east" {
-  provider                       = aws.west
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_peering_attachment_accepter.east_west.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway.west.association_default_route_table_id
-}
-
-resource "aws_ec2_transit_gateway_route_table_association" "west_eu" {
-  provider                       = aws.west
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_peering_attachment_accepter.west_eu.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway.west.association_default_route_table_id
-}
-
-resource "aws_ec2_transit_gateway_route_table_association" "eu_east" {
-  provider                       = aws.eu
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_peering_attachment_accepter.east_eu.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway.eu.association_default_route_table_id
-}
-
-resource "aws_ec2_transit_gateway_route_table_association" "eu_west" {
-  provider                       = aws.eu
-  transit_gateway_attachment_id  = aws_ec2_transit_gateway_peering_attachment_accepter.west_eu.id
-  transit_gateway_route_table_id = aws_ec2_transit_gateway.eu.association_default_route_table_id
-}
+# Peerings are auto-associated with the default TGW route table because the
+# TGWs above set default_route_table_association = "enable". No explicit
+# aws_ec2_transit_gateway_route_table_association resource is needed — adding
+# one would race against AWS's auto-association and fail with
+# Resource.AlreadyAssociated.
 
 # Static routes in each TGW route table for the two remote CIDRs.
 
