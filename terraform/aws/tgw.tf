@@ -3,37 +3,37 @@
 # resources for both the route table association and the route are required.
 
 resource "aws_ec2_transit_gateway" "east" {
-  provider                       = aws.east
-  description                    = "rp-stretch-east"
-  amazon_side_asn                = 64900
+  provider                        = aws.east
+  description                     = "rp-stretch-east"
+  amazon_side_asn                 = 64900
   default_route_table_association = "enable"
   default_route_table_propagation = "enable"
-  auto_accept_shared_attachments = "enable"
-  dns_support                    = "enable"
+  auto_accept_shared_attachments  = "enable"
+  dns_support                     = "enable"
 
   tags = { Name = "${local.cluster_name_east}-tgw" }
 }
 
 resource "aws_ec2_transit_gateway" "west" {
-  provider                       = aws.west
-  description                    = "rp-stretch-west"
-  amazon_side_asn                = 64901
+  provider                        = aws.west
+  description                     = "rp-stretch-west"
+  amazon_side_asn                 = 64901
   default_route_table_association = "enable"
   default_route_table_propagation = "enable"
-  auto_accept_shared_attachments = "enable"
-  dns_support                    = "enable"
+  auto_accept_shared_attachments  = "enable"
+  dns_support                     = "enable"
 
   tags = { Name = "${local.cluster_name_west}-tgw" }
 }
 
 resource "aws_ec2_transit_gateway" "eu" {
-  provider                       = aws.eu
-  description                    = "rp-stretch-eu"
-  amazon_side_asn                = 64902
+  provider                        = aws.eu
+  description                     = "rp-stretch-eu"
+  amazon_side_asn                 = 64902
   default_route_table_association = "enable"
   default_route_table_propagation = "enable"
-  auto_accept_shared_attachments = "enable"
-  dns_support                    = "enable"
+  auto_accept_shared_attachments  = "enable"
+  dns_support                     = "enable"
 
   tags = { Name = "${local.cluster_name_eu}-tgw" }
 }
@@ -215,10 +215,17 @@ locals {
   eu_route_table_ids   = concat(module.vpc_eu.private_route_table_ids, module.vpc_eu.public_route_table_ids)
 }
 
+# NOTE: count (not for_each) on aws_route. The route table IDs come from the
+# VPC module's outputs, which Terraform treats as computed at apply time.
+# for_each over those values fails with "Invalid for_each argument" because
+# Terraform can't determine the set keys at plan time. count works because
+# the LENGTH of the route_table_ids list is statically determinable from the
+# VPC module's input subnet count.
+
 resource "aws_route" "east_to_west" {
   provider               = aws.east
-  for_each               = toset(local.east_route_table_ids)
-  route_table_id         = each.value
+  count                  = length(local.east_route_table_ids)
+  route_table_id         = local.east_route_table_ids[count.index]
   destination_cidr_block = local.vpc_cidr_west
   transit_gateway_id     = aws_ec2_transit_gateway.east.id
 
@@ -227,8 +234,8 @@ resource "aws_route" "east_to_west" {
 
 resource "aws_route" "east_to_eu" {
   provider               = aws.east
-  for_each               = toset(local.east_route_table_ids)
-  route_table_id         = each.value
+  count                  = length(local.east_route_table_ids)
+  route_table_id         = local.east_route_table_ids[count.index]
   destination_cidr_block = local.vpc_cidr_eu
   transit_gateway_id     = aws_ec2_transit_gateway.east.id
 
@@ -237,8 +244,8 @@ resource "aws_route" "east_to_eu" {
 
 resource "aws_route" "west_to_east" {
   provider               = aws.west
-  for_each               = toset(local.west_route_table_ids)
-  route_table_id         = each.value
+  count                  = length(local.west_route_table_ids)
+  route_table_id         = local.west_route_table_ids[count.index]
   destination_cidr_block = local.vpc_cidr_east
   transit_gateway_id     = aws_ec2_transit_gateway.west.id
 
@@ -247,8 +254,8 @@ resource "aws_route" "west_to_east" {
 
 resource "aws_route" "west_to_eu" {
   provider               = aws.west
-  for_each               = toset(local.west_route_table_ids)
-  route_table_id         = each.value
+  count                  = length(local.west_route_table_ids)
+  route_table_id         = local.west_route_table_ids[count.index]
   destination_cidr_block = local.vpc_cidr_eu
   transit_gateway_id     = aws_ec2_transit_gateway.west.id
 
@@ -257,8 +264,8 @@ resource "aws_route" "west_to_eu" {
 
 resource "aws_route" "eu_to_east" {
   provider               = aws.eu
-  for_each               = toset(local.eu_route_table_ids)
-  route_table_id         = each.value
+  count                  = length(local.eu_route_table_ids)
+  route_table_id         = local.eu_route_table_ids[count.index]
   destination_cidr_block = local.vpc_cidr_east
   transit_gateway_id     = aws_ec2_transit_gateway.eu.id
 
@@ -267,8 +274,8 @@ resource "aws_route" "eu_to_east" {
 
 resource "aws_route" "eu_to_west" {
   provider               = aws.eu
-  for_each               = toset(local.eu_route_table_ids)
-  route_table_id         = each.value
+  count                  = length(local.eu_route_table_ids)
+  route_table_id         = local.eu_route_table_ids[count.index]
   destination_cidr_block = local.vpc_cidr_west
   transit_gateway_id     = aws_ec2_transit_gateway.eu.id
 
