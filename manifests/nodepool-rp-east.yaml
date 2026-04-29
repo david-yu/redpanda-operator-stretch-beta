@@ -11,7 +11,7 @@ spec:
   replicas: 2
   image:
     repository: redpandadata/redpanda
-    tag: v25.3.14
+    tag: v26.1.6
   services:
     perPod:
       remote:
