@@ -2,7 +2,7 @@
 
 A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Validated end-to-end on AWS EKS (Transit Gateway across `us-east-1`/`us-west-2`/`eu-west-1`); GCP and Azure Terraform configs follow the same pattern but have not yet been run end-to-end in this repo.
 
-This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference; this repo's `aws/`, `gcp/`, and `azure/` directories each bundle the terraform, manifests, and helm-values that actually work for that cloud — see [Troubleshooting](#troubleshooting) for the why behind each one.
+This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The `aws/`, `gcp/`, and `azure/` directories each bundle the terraform, manifests, and helm-values that actually work for that cloud — see [Troubleshooting](#troubleshooting) for the why behind each one.
 
 ## Table of contents
 
@@ -21,7 +21,7 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [9. Quick test — produce and consume across clusters](#9-quick-test--produce-and-consume-across-clusters)
 - [Optional demos](#optional-demos)
   - [Demo A: ordered leader pinning + region-failover fallback](#demo-a-ordered-leader-pinning--region-failover-fallback)
-  - [Demo B: ghost broker auto-decommission](#demo-b-ghost-broker-auto-decommission)
+  - [Demo B: regional failure + temporary failover-region capacity injection](#demo-b-regional-failure--temporary-failover-region-capacity-injection)
 - [Tear down](#tear-down)
 - [Troubleshooting](#troubleshooting)
 - [Cost (running)](#cost-running)
@@ -211,7 +211,7 @@ You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, 
 
 ### 5. cert-manager per cluster
 
-Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources. The original gist treats cert-manager as optional — that's wrong for any TLS-enabled deployment. cert-manager is independent of steps 1–4 and can be installed any time before step 6 (in parallel if you want to save wall-clock time).
+Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources — without it, broker pods stay stuck in `Init` waiting for the leaf-cert Secrets to appear (see [Troubleshooting](#troubleshooting) issue 6). cert-manager is independent of steps 1–4 and can be installed any time before step 6 (in parallel if you want to save wall-clock time).
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io --force-update && helm repo update
@@ -246,7 +246,7 @@ kubectl --context rp-west -n redpanda apply -f <cloud>/manifests/nodepool-rp-wes
 kubectl --context rp-eu   -n redpanda apply -f <cloud>/manifests/nodepool-rp-eu.yaml
 ```
 
-The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). Both differ from the gist; see [Troubleshooting](#troubleshooting) issues 7–8.
+The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). See [Troubleshooting](#troubleshooting) issues 7–8 for the why behind each.
 
 ### 7. Wait for green
 
@@ -325,7 +325,7 @@ If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection re
 
 ## Optional demos
 
-The default `stretchcluster.yaml` enables two stretch-cluster-specific features that aren't on by default in the gist's spec: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
+The default `stretchcluster.yaml` enables two stretch-cluster-specific features: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
 
 The committed defaults are:
 
@@ -481,86 +481,242 @@ A few caveats observed during validation:
 - The leader balancer **stalls during under-replicated periods** — when half a region's brokers go away, it pauses while the cluster is recovering, then resumes once partitions are re-replicated. Expect 30–90s of "leaders not yet on us-west-2" while replicas are being rebuilt elsewhere.
 - Cross-region heartbeats can flap during transitions — `rpk redpanda admin brokers list` may briefly show un-affected brokers as `IS-ALIVE=false`. Confirm against `rpk cluster health` (`Nodes down:` field) which uses the controller's authoritative view.
 
-### Demo B: ghost broker auto-decommission
+### Demo B: regional failure + temporary failover-region capacity injection
 
-When a broker is permanently gone for longer than `partition_autobalancing_node_autodecommission_timeout_sec`, the partition autobalancer should automatically issue a decommission for it — the broker leaves the cluster, replicas redistribute, and the membership shrinks. The relevant timeouts (`partition_autobalancing_node_availability_timeout_sec: 30`, `partition_autobalancing_node_autodecommission_timeout_sec: 60`) are already in `<cloud>/manifests/stretchcluster.yaml`, so the demo runs as-is.
+The 2 / 2 / 1 broker layout with `RF=5` survives a single-region outage in terms of *quorum* (3 of 5 brokers remain), but it cannot *self-heal* RF: with `RF=5` and only 3 reachable brokers, the partition autobalancer has nowhere to rebuild the missing two replicas, so:
 
-**Permanently kill one broker** (delete its pod AND its PVC so it can't come back with the same identity):
+- The two brokers from the lost region get marked unavailable after `partition_autobalancing_node_availability_timeout_sec` (30s)
+- Auto-decommission would normally start after `partition_autobalancing_node_autodecommission_timeout_sec` (60s), but it stalls (`partition_balancer/status: "stalled"`) because there's no way to rehome the replicas
+- Brokers from the lost region stay in `draining`/`active` indefinitely, and every `RF=5` topic shows under-replicated partitions
 
-```bash
-kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=1
-kubectl --context rp-east -n redpanda delete pvc datadir-redpanda-rp-east-1
-```
+The operational fix is to **add capacity in a fourth, separate failover region**. As soon as the cluster has 5 reachable brokers again, re-replication unblocks, the autobalancer drains the two lost brokers, and the cluster returns to RF=5 across the new layout. This demo walks through the full sequence: simulate the regional failure, observe the stall, deploy the failover region, watch recovery, then restore the primary and decommission the failover.
 
-```
-statefulset.apps/redpanda-rp-east scaled
-persistentvolumeclaim "datadir-redpanda-rp-east-1" deleted
-```
+> ⚠ **More than just `kubectl` calls.** Unlike Demo A, this demo provisions a 4th K8s cluster (Terraform / `gcloud container clusters create` / `eksctl` / `az aks create`) and rolls a fresh helm release. Plan ~15-20 min of wall-clock and the additional infra cost while the failover region is up.
 
-**Wait and watch broker 1 transition through `active → draining → (gone)`**:
+**Step 1 — simulate the regional failure**
 
 ```bash
-for i in $(seq 1 20); do
+kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
+```
+
+After ~90s (30s availability + 60s autodecom timeouts), check broker state from a surviving region:
+
+```bash
+kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
+  rpk redpanda admin brokers list
+```
+
+```
+ID  HOST                         RACK      MEMBERSHIP  IS-ALIVE
+0   redpanda-rp-east-0.redpanda  us-east1  active      false
+1   redpanda-rp-east-1.redpanda  us-east1  draining    false
+2   redpanda-rp-eu-0.redpanda    us-east4  active      true
+3   redpanda-rp-west-0.redpanda  us-west1  active      true
+4   redpanda-rp-west-1.redpanda  us-west1  active      true
+```
+
+**Step 2 — confirm the partition autobalancer is stalled**
+
+```bash
+kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
+  rpk cluster health
+```
+
+```
+Healthy:                          false
+Unhealthy reasons:                [nodes_down under_replicated_partitions]
+All nodes:                        [0 1 2 3 4]
+Nodes down:                       [0 1]
+Under-replicated partitions:      18      # all RF=5 topics across the cluster
+```
+
+The autobalancer status itself confirms the stall (admin API on any reachable broker):
+
+```bash
+kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
+  curl -ks --cacert /etc/tls/certs/default/ca.crt \
+       --cert /etc/tls/certs/default/tls.crt --key /etc/tls/certs/default/tls.key \
+  https://localhost:9644/v1/cluster/partition_balancer/status
+```
+
+```json
+{
+  "status": "stalled",
+  "violations": { "unavailable_nodes": [0, 1] },
+  "current_reassignments_count": 0
+}
+```
+
+**Step 3 — provision a fourth K8s cluster (rp-failover)**
+
+Pick a healthy region distinct from the three existing ones — e.g. `us-central1` for GCP — and create a 4th GKE cluster on the same VPC. The simplest path is to extend the terraform `clusters` map (preferred for repeatability), but you can also one-shot it with `gcloud` for a true emergency response:
+
+```bash
+# Pick a non-overlapping subnet/pods/services CIDR triple
+gcloud container clusters create rp-failover \
+  --region us-central1 \
+  --network <existing-vpc> \
+  --create-subnetwork name=rp-failover-subnet,range=10.40.0.0/20 \
+  --cluster-ipv4-cidr 10.140.0.0/16 \
+  --services-ipv4-cidr 10.141.0.0/20 \
+  --release-channel rapid --machine-type n2-standard-4 --num-nodes 3 \
+  --workload-pool=<project>.svc.id.goog \
+  --project <project>
+
+gcloud container clusters get-credentials rp-failover --region us-central1 --project <project>
+kubectl config rename-context gke_<project>_us-central1_rp-failover rp-failover
+```
+
+The new region's cross-cluster firewall rule must allow the same five ports (`9443, 33145, 9093, 8082, 9644`) from/to all four pod CIDRs. Update the existing `redpanda-stretch-validation-cross-cluster` rule's `source_ranges` and `target_tags` to include rp-failover's pod CIDR.
+
+**Step 4 — bootstrap the new cluster into the multicluster, install operator + cert-manager, apply the StretchCluster + a 2-broker NodePool**
+
+```bash
+# 1. Create the redpanda namespace + pre-create the peer LB Service
+kubectl --context rp-failover create ns redpanda
+kubectl --context rp-failover -n redpanda apply -f - <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: rp-failover-multicluster-peer
+  namespace: redpanda
+  annotations:
+    networking.gke.io/load-balancer-type: Internal
+spec:
+  type: LoadBalancer
+  ports: [{ port: 9443, targetPort: 9443 }]
+  selector: { app.kubernetes.io/name: operator, app.kubernetes.io/instance: rp-failover }
+EOF
+
+# 2. Bootstrap multicluster (idempotent — re-runs preserve existing TLS state)
+rpk k8s multicluster bootstrap \
+  --context rp-east --context rp-west --context rp-eu --context rp-failover \
+  --namespace redpanda --loadbalancer
+
+# 3. Install cert-manager + operator on the new cluster
+helm --kube-context rp-failover upgrade --install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace --version v1.17.2 \
+  --set crds.enabled=true --wait
+
+kubectl --context rp-failover -n redpanda create secret generic redpanda-license \
+  --from-file=license.key="$RP_LICENSE" --dry-run=client -o yaml \
+  | kubectl --context rp-failover apply -f -
+
+# Render a values file for rp-failover — same shape as the others, with the new
+# cluster's API server endpoint and a 4-entry peers list.
+helm --kube-context rp-failover upgrade --install rp-failover redpanda/operator \
+  --namespace redpanda --version 26.2.1-beta.1 --devel \
+  -f /tmp/values-rp-failover.yaml --wait --timeout 5m
+
+# 4. Update the OTHER three clusters' values files to also list 4 peers, then helm upgrade
+for C in rp-east rp-west rp-eu; do
+  helm --kube-context "$C" upgrade "$C" redpanda/operator \
+    --namespace redpanda --version 26.2.1-beta.1 --devel \
+    -f /tmp/values-${C}.yaml --reuse-values=false
+done
+
+# 5. Apply the StretchCluster spec + a 2-broker NodePool on the failover cluster
+kubectl --context rp-failover -n redpanda apply -f gcp/manifests/stretchcluster.yaml
+cat <<'EOF' | kubectl --context rp-failover -n redpanda apply -f -
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: NodePool
+metadata: { name: rp-failover, namespace: redpanda }
+spec:
+  clusterRef: { group: cluster.redpanda.com, kind: StretchCluster, name: redpanda }
+  replicas: 2
+  image: { repository: redpandadata/redpanda, tag: v26.1.6 }
+  services: { perPod: { remote: { enabled: true } } }
+EOF
+```
+
+**Step 5 — watch recovery (~5–10 min)**
+
+```bash
+for i in $(seq 1 30); do
   echo "--- $(date +%T) ---"
-  kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
-    rpk redpanda admin brokers list 2>/dev/null | awk 'NR>1 {print $1, $6, $7}'
+  kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
+    rpk redpanda admin brokers list | awk 'NR>1 {print $1, $4, $6, $7}'
   sleep 30
 done
 ```
 
-Expected progression of the `ID  MEMBERSHIP  IS-ALIVE` columns over ~3 minutes (`/i:` annotations added for clarity):
+Expected progression:
 
 ```
---- T+0:00 ---           # broker 1 just removed; still in roster, marked alive
-0 active true
-1 active true
-2 active true
-3 active true
-4 active true
+--- T+0:00 ---       # rp-failover brokers (5, 6) just joined; brokers 0, 1 still stuck
+0 us-east1     active   false
+1 us-east1     draining false
+2 us-east4     active   true
+3 us-west1     active   true
+4 us-west1     active   true
+5 us-central1  active   true
+6 us-central1  active   true
 
---- T+0:30 ---           # availability_timeout (30s) elapsed → broker 1 marked dead
-0 active true
-1 active false
-2 active true
-3 active true
-4 active true
+--- T+5:00 ---       # autobalancer un-stalled (5 reachable brokers); drain progressing
+0 us-east1     draining false
+1 us-east1     draining false
+2 us-east4     active   true
+3 us-west1     active   true
+4 us-west1     active   true
+5 us-central1  active   true
+6 us-central1  active   true
 
---- T+1:30 ---           # autodecommission_timeout (60s) elapsed → autobalancer
-0 active true            # starts draining broker 1's replicas onto others
-1 draining false
-2 active true
-3 active true
-4 active true
-
---- T+3:00 ---           # drain complete; broker 1 evicted from the list
-0 active true
-2 active true
-3 active true
-4 active true
+--- T+8:00 ---       # drain complete; brokers 0, 1 evicted; 5 active brokers again
+2 us-east4     active   true
+3 us-west1     active   true
+4 us-west1     active   true
+5 us-central1  active   true
+6 us-central1  active   true
 ```
 
-Confirm with the partition layout — broker 1 should no longer appear in any `REPLICAS` column:
-
-```bash
-kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
-  rpk topic describe leader-pinning-demo -p
-```
+`rpk topic describe` should now show every RF=5 topic with replicas drawn from `[2 3 4 5 6]`:
 
 ```
-PARTITION  LEADER  EPOCH  REPLICAS   LOG-START-OFFSET  HIGH-WATERMARK
-0          0       3      [0 2 3 4]  0                 0
-1          0       3      [0 2 3 4]  0                 0
+PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
+0          3       4      [2 3 4 5 6]  0                 0
+1          5       4      [2 3 4 5 6]  0                 0
 ...
 ```
 
-(All 12 partitions now have RF=4 over brokers `[0 2 3 4]` — the `1` is gone from every replica set, and the cluster's effective replica budget is one broker smaller than before.)
+`rpk cluster health` reports `Healthy: true` and `Under-replicated partitions: 0`, and `partition_balancer/status` returns `"status": "ready"`.
 
-**Important caveats observed during validation** that may differ from documentation:
+**Step 6 — restore the primary, decommission the failover**
 
-- **Auto-decom requires the autobalancer to have a healthy view of the cluster.** The autobalancer's `status` field (visible at `https://<broker>:9644/v1/cluster/partition_balancer/status`) shows `stalled` when too many brokers appear unavailable. Cross-region heartbeat flapping during a regional outage can stall it indefinitely. If you see `"status": "stalled"` and the broker isn't being decommissioned, fall back to a manual decommission: `rpk redpanda admin brokers decommission <id> --skip-liveness-check`.
+When us-east1 is back online, bring rp-east up:
+
+```bash
+kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
+```
+
+Two new brokers join (IDs 7, 8) in rack `us-east1` and start picking up replicas. Once `Under-replicated partitions: 0` again, drain the temporary failover brokers and tear down rp-failover:
+
+```bash
+# Drain failover brokers 5 and 6
+for ID in 5 6; do
+  kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+    rpk redpanda admin brokers decommission "$ID"
+done
+
+# Wait for both to leave the roster (poll `rpk redpanda admin brokers list`)
+
+# Then remove the rp-failover region
+kubectl --context rp-failover -n redpanda delete nodepool rp-failover
+helm --kube-context rp-failover uninstall rp-failover -n redpanda
+helm --kube-context rp-failover uninstall cert-manager -n cert-manager
+gcloud container clusters delete rp-failover --region us-central1
+```
+
+Don't forget to **revert the four-cluster `multicluster.peers` lists back to three** in each surviving cluster's helm values, and `helm upgrade` so rp-east, rp-west, rp-eu stop trying to peer with the deleted cluster.
+
+The cluster ends back at the original 2 / 2 / 1 layout — 2 brokers in us-east1 (new IDs 7, 8 in place of the original 0, 1), 2 in us-west1 (3, 4), 1 in us-east4 (2). Quorum properties and rack-leader preferences are restored.
+
+**Important caveats observed during validation:**
+
+- **Auto-decom requires the autobalancer to have a healthy view of the cluster.** With `RF=N` (where N is the broker count), losing any broker leaves no spare capacity — the autobalancer can't move replicas off a "ghost" broker because there's nowhere for them to land. The capacity-injection step is *required*; you cannot get back to `Healthy: true` without it. If you choose `RF < broker count` (e.g. `RF=3` over a 5-broker cluster) the autobalancer will self-heal a single broker loss without intervention.
 - **The operator reverts cluster config from the StretchCluster spec on every reconcile.** Any `rpk cluster config set` against keys that are also in `spec.config.cluster` will be undone on the next reconcile pass. If you want a different timeout for a one-off demo, edit `<cloud>/manifests/stretchcluster.yaml` and re-apply rather than setting it via rpk.
+- **Cross-region heartbeats and the hardcoded 100 ms `node_status_rpc` timeout.** Inter-continental region pairs (e.g. `europe-west1 ↔ us-east1`, RTT ~100 ms) will *appear* unavailable to the controller during heartbeat hiccups, which can trigger an unwanted decommission cascade. Pick region triples whose worst-case pairwise RTT stays under ~70 ms (see [Cost (running)](#cost-running) for a GCP example using `us-east1 / us-west1 / us-east4`).
 
-After either demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replicated partitions) and that the `multicluster.peers`/raft layer is still intact via `rpk k8s multicluster status`.
+After the demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replicated partitions) and that the `multicluster.peers`/raft layer is intact via `rpk k8s multicluster status`.
 
 ## Tear down
 
@@ -685,7 +841,7 @@ In flat mode the operator renders headless Services and manages EndpointSlices w
 
 ### 8. `flat` mode set but per-pool Services for remote pools don't exist
 
-Symptom: `kubectl get svc -n redpanda` in `rp-east` shows only `redpanda-rp-east-0`, not `redpanda-rp-west-0` or `redpanda-rp-eu-0`. The operator is skipping rendering for remote pools because `services.perPod.remote.enabled: false` (the gist's value). Set it to `true` in every NodePool.
+Symptom: `kubectl get svc -n redpanda` in `rp-east` shows only `redpanda-rp-east-0`, not `redpanda-rp-west-0` or `redpanda-rp-eu-0`. The operator skips rendering for remote pools when `services.perPod.remote.enabled: false`. Set it to `true` in every NodePool.
 
 ### 9. StretchCluster `ResourcesSynced=False`: "spec.clusterIPs[0]: Invalid value: ['None']: may not change once set"
 
@@ -693,7 +849,7 @@ The operator wants to convert per-pod Services to headless (clusterIP=None) for 
 
 ### 10. `rpk topic create` from inside a broker pod hangs / "i/o timeout" on port 9093
 
-Kafka client port `9093` (and Pandaproxy `8082`, Admin `9644`) are not open across cluster CIDRs in firewall/NSG rules by default. The original gist only mentions `33145`. The Terraform in this repo opens all five via the `cross_cluster_ports` variable on every cloud (see `aws/terraform/sg.tf`, `gcp/terraform/firewall.tf`, `azure/terraform/nsg.tf`).
+Kafka client port `9093` (and Pandaproxy `8082`, Admin `9644`) are not open across cluster CIDRs in firewall/NSG rules by default — many setup guides only mention the broker RPC port `33145`. The Terraform in this repo opens all five via the `cross_cluster_ports` variable on every cloud (see `aws/terraform/sg.tf`, `gcp/terraform/firewall.tf`, `azure/terraform/nsg.tf`).
 
 ### 11. PVC `Pending`: "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims"
 
@@ -730,4 +886,4 @@ Tear down promptly when validation is done.
 
 ## Source
 
-This repo was generated during a one-shot validation run of `operator/v26.2.1-beta.1` on AWS. The reference doc is the [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32). Issues found during validation are tracked above.
+This repo was generated during a one-shot validation run of `operator/v26.2.1-beta.1` on AWS, then re-validated on GCP. Issues found during validation are tracked under [Troubleshooting](#troubleshooting).
