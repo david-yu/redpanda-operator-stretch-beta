@@ -613,22 +613,29 @@ The failover region needs three things: (a) a K8s cluster reachable from the exi
 
 | Cloud | Failover terraform | What it does |
 |---|---|---|
-| **GCP / GKE** | [`gcp/terraform-failover/`](gcp/terraform-failover/README.md) | Looks up the existing global VPC by name, adds a 4th subnet + Cloud Router/NAT, creates a 4th GKE cluster, and adds an additive firewall rule that includes the failover pod CIDR. **Validated.** |
-| **AWS / EKS** | [`aws/terraform-failover/`](aws/terraform-failover/README.md) | New VPC + EKS cluster, new TGW attachment, three TGW peering attachments (failover ↔ each existing region), route-table updates, SG rules. **Skeleton — recipe + manual `eksctl` fallback in the directory README.** |
-| **Azure / AKS** | [`azure/terraform-failover/`](azure/terraform-failover/README.md) | New resource group + VNet + AKS cluster, six VNet peerings (failover ↔ each existing VNet, both directions), NSG rules. **Skeleton — recipe + manual `az aks create` fallback in the directory README.** |
+| **GCP / GKE** | [`gcp/terraform-failover/`](gcp/terraform-failover/README.md) | Looks up the existing global VPC by name, adds a 4th subnet + Cloud Router/NAT, creates a 4th GKE cluster in `us-central1`, and adds an additive firewall rule for the failover pod CIDR. Validated end-to-end. |
+| **AWS / EKS** | [`aws/terraform-failover/`](aws/terraform-failover/README.md) | New VPC + EKS cluster in `us-east-2`, new TGW + 3 peering attachments (with accepters in the existing regions), 6 TGW routes, VPC route-table entries on both sides, additive SG ingress rules on existing node SGs. Looks up the existing TGWs/VPCs/node SGs by tag — no `terraform_remote_state` needed. `terraform validate` passes. |
+| **Azure / AKS** | [`azure/terraform-failover/`](azure/terraform-failover/README.md) | New resource group + VNet + AKS cluster in `centralus`, 6 VNet peerings (failover ↔ each existing × both directions), additive NSG rules on existing NSGs for the failover VNet CIDR. `terraform validate` passes. |
 
 ```bash
-# GCP — fully working, ~10–12 min
-cd gcp/terraform-failover
+# Pick your cloud:
+cd <aws|gcp|azure>/terraform-failover
 terraform init
-terraform apply -var project_id=<your-gcp-project>
-terraform output -raw failover_kubectl_setup_command | bash    # registers context: rp-failover
-terraform output failover_peer_lb_address                       # for multicluster.peers
-terraform output -raw failover_gke_endpoint                     # for multicluster.apiServerExternalAddress
+terraform apply              # AWS / Azure
+# or:
+terraform apply -var project_id=<your-gcp-project>     # GCP
 
-# AWS / Azure — until the .tf is checked in, follow the recipe in
-#   aws/terraform-failover/README.md  or  azure/terraform-failover/README.md
+# Capture the addresses for the helm values templates (output names differ
+# slightly per cloud — AWS emits a hostname, GCP/Azure emit IPs):
+terraform output -raw failover_kubectl_setup_command | bash    # registers context: rp-failover
+terraform output failover_peer_lb_address          # GCP / Azure   → for multicluster.peers
+terraform output failover_peer_lb_hostname         # AWS           → for multicluster.peers
+terraform output -raw failover_gke_endpoint        # GCP   → multicluster.apiServerExternalAddress
+terraform output -raw failover_eks_endpoint        # AWS   → multicluster.apiServerExternalAddress
+terraform output -raw failover_aks_fqdn            # Azure → prefix with https:// for apiServerExternalAddress
 ```
+
+> AWS only: the failover cluster needs the AWS Load Balancer Controller installed before the peer Service can provision an internal NLB. The terraform-failover stack does not install it (to keep cross-cloud parity); see [`aws/terraform-failover/README.md`](aws/terraform-failover/README.md#prerequisites) for the helm-install snippet to run after `terraform apply` and before bootstrap.
 
 **Step 4 — bootstrap, install, apply manifests on the failover cluster (cloud-agnostic)**
 
