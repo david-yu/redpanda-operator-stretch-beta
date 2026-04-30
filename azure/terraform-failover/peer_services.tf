@@ -25,6 +25,7 @@ resource "kubernetes_service" "peer_failover" {
     }
     publish_not_ready_addresses = true
   }
+  depends_on = [azurerm_role_assignment.aks_failover_subnet]
 }
 
 data "kubernetes_service" "peer_failover" {

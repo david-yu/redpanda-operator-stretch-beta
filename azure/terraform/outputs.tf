@@ -18,10 +18,14 @@ output "regions" {
 
 output "aks_endpoints" {
   description = "AKS API server endpoints — paste into multicluster.apiServerExternalAddress in helm values."
+  # `kube_config` blocks are flagged sensitive by the azurerm provider because
+  # they wrap credentials, but the API host URL alone isn't a secret — it's
+  # derivable from `<cluster>.<region>.azmk8s.io` and we surface it for users
+  # to paste into helm values. nonsensitive() unwraps just the host string.
   value = {
-    east = azurerm_kubernetes_cluster.east.kube_config[0].host
-    west = azurerm_kubernetes_cluster.west.kube_config[0].host
-    eu   = azurerm_kubernetes_cluster.eu.kube_config[0].host
+    east = nonsensitive(azurerm_kubernetes_cluster.east.kube_config[0].host)
+    west = nonsensitive(azurerm_kubernetes_cluster.west.kube_config[0].host)
+    eu   = nonsensitive(azurerm_kubernetes_cluster.eu.kube_config[0].host)
   }
 }
 

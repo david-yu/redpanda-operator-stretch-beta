@@ -5,9 +5,9 @@ variable "project_name" {
 }
 
 variable "kubernetes_version" {
-  description = "AKS Kubernetes version."
+  description = "AKS Kubernetes version. Must be a currently-supported (non-LTS-only) GA version — `az aks get-versions --location <region>` lists what's available. AKS rolls 1.31 / 1.30 / older to LTS-only periodically; bump this when that happens."
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "vm_size" {
@@ -17,9 +17,9 @@ variable "vm_size" {
 }
 
 variable "node_count" {
-  description = "Per-cluster node count."
+  description = "Per-cluster node count. With the default Standard_D4s_v5 (4 vCPU each) this consumes 8 vCPUs/region — bump up only if your subscription's regional vCPU quota for the DSv5 family allows it (default sandbox quota is 10/region)."
   type        = number
-  default     = 3
+  default     = 2
 }
 
 variable "node_disk_size_gb" {
@@ -62,7 +62,7 @@ variable "clusters" {
       dns_service_ip = "10.121.0.10"
     }
     eu = {
-      region         = "westeurope"
+      region         = "centralus"
       name           = "rp-eu"
       vnet_cidr      = "10.30.0.0/16"
       subnet_cidr    = "10.30.0.0/20"

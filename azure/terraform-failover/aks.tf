@@ -17,13 +17,24 @@ resource "azurerm_kubernetes_cluster" "failover" {
 
   identity { type = "SystemAssigned" }
 
+  # Traditional Azure CNI (no overlay) so pod IPs come from the VNet subnet
+  # and route across peered VNets — overlay-mode VXLAN encapsulation breaks
+  # cross-cluster pod IP traffic that Redpanda's flat mode requires.
   network_profile {
-    network_plugin      = "azure"
-    network_plugin_mode = "overlay"
-    pod_cidr            = var.failover_pod_cidr
-    service_cidr        = var.failover_service_cidr
-    dns_service_ip      = var.failover_dns_service_ip
-    load_balancer_sku   = "standard"
-    outbound_type       = "loadBalancer"
+    network_plugin    = "azure"
+    service_cidr      = var.failover_service_cidr
+    dns_service_ip    = var.failover_dns_service_ip
+    load_balancer_sku = "standard"
+    outbound_type     = "loadBalancer"
   }
+}
+
+# Network Contributor on the failover subnet so the AKS cloud-controller can
+# provision LoadBalancer Services in the BYO VNet — without this, the peer
+# Service stays Pending with AuthorizationFailed and finalizer-based cleanup
+# at delete time hangs.
+resource "azurerm_role_assignment" "aks_failover_subnet" {
+  scope                = azurerm_subnet.failover_nodes.id
+  role_definition_name = "Network Contributor"
+  principal_id         = azurerm_kubernetes_cluster.failover.identity[0].principal_id
 }

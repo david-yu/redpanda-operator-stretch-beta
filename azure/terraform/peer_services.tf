@@ -44,6 +44,13 @@ resource "kubernetes_service" "peer_east" {
     }
     publish_not_ready_addresses = true
   }
+  # Provisioning a LoadBalancer Service against a BYO VNet requires the AKS
+  # cloud-controller-manager to have Network Contributor on the subnet —
+  # same role is needed during finalizer-based LB cleanup at delete time.
+  # Depend on the role assignment so terraform destroys this Service BEFORE
+  # tearing down the role assignment, otherwise the LB-cleanup finalizer
+  # hangs indefinitely with AuthorizationFailed.
+  depends_on = [azurerm_role_assignment.aks_east_subnet]
 }
 
 resource "kubernetes_service" "peer_west" {
@@ -67,6 +74,7 @@ resource "kubernetes_service" "peer_west" {
     }
     publish_not_ready_addresses = true
   }
+  depends_on = [azurerm_role_assignment.aks_west_subnet]
 }
 
 resource "kubernetes_service" "peer_eu" {
@@ -90,6 +98,7 @@ resource "kubernetes_service" "peer_eu" {
     }
     publish_not_ready_addresses = true
   }
+  depends_on = [azurerm_role_assignment.aks_eu_subnet]
 }
 
 # Wait for each LB IP to materialize.

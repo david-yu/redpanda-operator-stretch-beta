@@ -21,14 +21,17 @@ resource "azurerm_kubernetes_cluster" "east" {
 
   identity { type = "SystemAssigned" }
 
+  # Traditional Azure CNI (no overlay): pod IPs come directly from the
+  # VNet subnet, so they're routable across peered VNets out of the box.
+  # Overlay mode encapsulates pod traffic in VXLAN, which doesn't traverse
+  # VNet peering — pods in cluster A can't reach pod IPs in cluster B,
+  # which breaks Redpanda's networking.crossClusterMode: flat.
   network_profile {
-    network_plugin      = "azure"
-    network_plugin_mode = "overlay"
-    pod_cidr            = var.clusters["east"].pod_cidr
-    service_cidr        = var.clusters["east"].service_cidr
-    dns_service_ip      = var.clusters["east"].dns_service_ip
-    load_balancer_sku   = "standard"
-    outbound_type       = "loadBalancer"
+    network_plugin    = "azure"
+    service_cidr      = var.clusters["east"].service_cidr
+    dns_service_ip    = var.clusters["east"].dns_service_ip
+    load_balancer_sku = "standard"
+    outbound_type     = "loadBalancer"
   }
 }
 
@@ -52,13 +55,11 @@ resource "azurerm_kubernetes_cluster" "west" {
   identity { type = "SystemAssigned" }
 
   network_profile {
-    network_plugin      = "azure"
-    network_plugin_mode = "overlay"
-    pod_cidr            = var.clusters["west"].pod_cidr
-    service_cidr        = var.clusters["west"].service_cidr
-    dns_service_ip      = var.clusters["west"].dns_service_ip
-    load_balancer_sku   = "standard"
-    outbound_type       = "loadBalancer"
+    network_plugin    = "azure"
+    service_cidr      = var.clusters["west"].service_cidr
+    dns_service_ip    = var.clusters["west"].dns_service_ip
+    load_balancer_sku = "standard"
+    outbound_type     = "loadBalancer"
   }
 }
 
@@ -82,12 +83,10 @@ resource "azurerm_kubernetes_cluster" "eu" {
   identity { type = "SystemAssigned" }
 
   network_profile {
-    network_plugin      = "azure"
-    network_plugin_mode = "overlay"
-    pod_cidr            = var.clusters["eu"].pod_cidr
-    service_cidr        = var.clusters["eu"].service_cidr
-    dns_service_ip      = var.clusters["eu"].dns_service_ip
-    load_balancer_sku   = "standard"
-    outbound_type       = "loadBalancer"
+    network_plugin    = "azure"
+    service_cidr      = var.clusters["eu"].service_cidr
+    dns_service_ip    = var.clusters["eu"].dns_service_ip
+    load_balancer_sku = "standard"
+    outbound_type     = "loadBalancer"
   }
 }

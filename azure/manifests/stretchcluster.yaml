@@ -40,7 +40,7 @@ spec:
       # Ordered leader pinning. The leader balancer places partition leaders in
       # the FIRST listed rack with available brokers; if every broker in that
       # rack is unreachable, it falls through to the next rack, and so on.
-      default_leaders_preference: "racks:eastus,westus2,westeurope"
+      default_leaders_preference: "racks:eastus,westus2,centralus"
       # Time a broker can be unreachable before it's marked unavailable for
       # partition movement. Demo value (default: 900). Raise for production.
       partition_autobalancing_node_availability_timeout_sec: 30
