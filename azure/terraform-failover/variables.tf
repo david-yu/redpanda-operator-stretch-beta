@@ -17,9 +17,9 @@ variable "vm_size" {
 }
 
 variable "node_count" {
-  description = "Per-cluster node count for the failover cluster."
+  description = "Per-cluster node count for the failover cluster. Default 2 fits the typical 10 vCPU/region sandbox quota for the DSv5 family (2× Standard_D4s_v5 = 8 vCPU, leaving headroom for upgrade surge nodes)."
   type        = number
-  default     = 3
+  default     = 2
 }
 
 variable "node_disk_size_gb" {
@@ -28,13 +28,13 @@ variable "node_disk_size_gb" {
   default     = 50
 }
 
-# Failover-specific knobs. Defaults pick `centralus` (~30 ms RTT to eastus,
-# ~50 ms to westus2). CIDRs do not overlap the main stack defaults
-# (10.{10,20,30}.0.0/16 / 10.{110,120,130}.0.0/16 / 10.{111,121,131}.0.0/20).
+# Failover-specific knobs. Defaults pick `eastus2` (~5 ms RTT to eastus,
+# distinct from the main stack's eastus / westus2 / centralus). CIDRs do
+# not overlap the main stack defaults (10.{10,20,30}.0.0/16 etc.).
 variable "failover_region" {
-  description = "Azure region for the failover cluster."
+  description = "Azure region for the failover cluster. Must be distinct from the three regions in the main stack's `clusters` map."
   type        = string
-  default     = "centralus"
+  default     = "eastus2"
 }
 
 variable "failover_cluster_name" {
