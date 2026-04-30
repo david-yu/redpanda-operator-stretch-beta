@@ -14,9 +14,9 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [2. Install the rpk-k8s plugin](#2-install-the-rpk-k8s-plugin)
   - [3. Bootstrap multicluster TLS + kubeconfig secrets](#3-bootstrap-multicluster-tls--kubeconfig-secrets)
   - [4. License Secret + helm install](#4-license-secret--helm-install)
-  - [5. cert-manager per cluster](#5-cert-manager-per-cluster)
+  - [5. Install cert-manager per cluster](#5-install-cert-manager-per-cluster)
   - [6. Apply StretchCluster + NodePools](#6-apply-stretchcluster--nodepools)
-  - [7. Wait for green](#7-wait-for-green)
+  - [7. Wait for StretchCluster status conditions to go green](#7-wait-for-stretchcluster-status-conditions-to-go-green)
   - [8. Validate stretch cluster health using rpk k8s multicluster](#8-validate-stretch-cluster-health-using-rpk-k8s-multicluster)
   - [9. Quick test — produce and consume across clusters](#9-quick-test--produce-and-consume-across-clusters)
 - [Optional demos](#optional-demos)
@@ -25,7 +25,6 @@ This repo captures the exact configs that brought a stretch cluster up green on 
 - [Tear down](#tear-down)
 - [Troubleshooting](#troubleshooting)
 - [Cost (running)](#cost-running)
-- [Source](#source)
 
 ## Repo layout
 
@@ -209,7 +208,7 @@ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu 
 
 You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, `UNHEALTHY=0`, and the four cross-cluster checks ✓.
 
-### 5. cert-manager per cluster
+### 5. Install cert-manager per cluster
 
 Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources — without it, broker pods stay stuck in `Init` waiting for the leaf-cert Secrets to appear (see [Troubleshooting](#troubleshooting) issue 5). cert-manager is independent of steps 1–4 and can be installed any time before step 6 (in parallel if you want to save wall-clock time).
 
@@ -230,11 +229,74 @@ wait
 
 (Terraform already annotates the default StorageClass on AWS — `gp2`. GKE and AKS ship a default already; no patch needed.)
 
+The repo ships one `stretchcluster.yaml` and three `nodepool-rp-{east,west,eu}.yaml` per cloud. The StretchCluster CR is identical across the three K8s clusters (it's the cluster-wide Redpanda spec); each NodePool defines that cluster's slice of the broker fleet — `replicas: 2` for rp-east and rp-west, `replicas: 1` for rp-eu (the 2 / 2 / 1 quorum-tiebreaker shape — see [Broker layout](#broker-layout-2--2--1-with-rf5)).
+
+**`<cloud>/manifests/stretchcluster.yaml`** (GCP example shown — AWS/Azure differ only in the `default_leaders_preference` rack list):
+
+```yaml
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: StretchCluster
+metadata:
+  name: redpanda
+  namespace: redpanda
+spec:
+  rbac:
+    enabled: true
+  external:
+    enabled: false
+  networking:
+    crossClusterMode: flat              # operator manages headless Services + EndpointSlices
+  rackAwareness:
+    enabled: true
+    nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region
+  tls:
+    enabled: true
+    certs:
+      default:
+        caEnabled: true
+  enterprise:
+    licenseSecretRef:
+      name: redpanda-license
+      key: license.key
+  config:
+    cluster:
+      # Ordered leader pinning — rack list is cloud-specific:
+      #   AWS:   racks:us-east-1,us-west-2,eu-west-1
+      #   GCP:   racks:us-east1,us-west1,us-east4
+      #   Azure: racks:eastus,westus2,westeurope
+      default_leaders_preference: "racks:us-east1,us-west1,us-east4"
+      partition_autobalancing_node_availability_timeout_sec: 30   # demo-fast (default 900)
+      partition_autobalancing_node_autodecommission_timeout_sec: 60   # demo-fast (default 600)
+```
+
+**`<cloud>/manifests/nodepool-rp-east.yaml`** (rp-west uses an identical shape with `name: rp-west`; rp-eu uses `replicas: 1`):
+
+```yaml
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: NodePool
+metadata:
+  name: rp-east
+  namespace: redpanda
+spec:
+  clusterRef:
+    group: cluster.redpanda.com
+    kind: StretchCluster
+    name: redpanda
+  replicas: 2                           # rp-eu uses replicas: 1 (the tiebreaker)
+  image:
+    repository: redpandadata/redpanda
+    tag: v26.1.6
+  services:
+    perPod:
+      remote:
+        enabled: true                   # required so per-pool Services for remote pools render
+```
+
 Apply the StretchCluster (identical on every cluster):
 
 ```bash
 for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" -n redpanda apply -f <cloud>/<cloud>/manifests/stretchcluster.yaml
+  kubectl --context "$C" -n redpanda apply -f <cloud>/manifests/stretchcluster.yaml
 done
 ```
 
@@ -248,7 +310,7 @@ kubectl --context rp-eu   -n redpanda apply -f <cloud>/manifests/nodepool-rp-eu.
 
 The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). See [Troubleshooting](#troubleshooting) issues 6–7 for the why behind each.
 
-### 7. Wait for green
+### 7. Wait for StretchCluster status conditions to go green
 
 ```bash
 kubectl --context rp-east -n redpanda get stretchcluster redpanda \
@@ -889,7 +951,3 @@ kubectl --context <c> -n redpanda delete pod redpanda-<pool>-0 --grace-period=0 
 - **Azure**: 3× AKS control plane (free with paid SKU) + 9× Standard_D4s_v5 (~$0.19/hr each) + 3× internal Standard LB ≈ **~$1.80/hr**, plus VNet peering + cross-region transfer.
 
 Tear down promptly when validation is done.
-
-## Source
-
-This repo was generated during a one-shot validation run of `operator/v26.2.1-beta.1` on AWS, then re-validated on GCP. Issues found during validation are tracked under [Troubleshooting](#troubleshooting).
