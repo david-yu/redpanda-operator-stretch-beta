@@ -70,9 +70,9 @@ variable "machine_type" {
 }
 
 variable "node_count" {
-  description = "Per-zone node count for the regional failover node pool."
+  description = "Per-zone node count for the regional failover node pool. Regional clusters distribute this to each zone, so default 1 → 3 nodes total (one per zone) — enough headroom for the 2 failover broker pods, operator, and cert-manager."
   type        = number
-  default     = 3
+  default     = 1
 }
 
 variable "node_disk_size_gb" {

@@ -26,9 +26,9 @@ variable "machine_type" {
 }
 
 variable "node_count" {
-  description = "Per-region node count (single regional node pool)."
+  description = "Per-zone node count for the regional GKE node pool. Regional clusters distribute this number to EACH of the region's zones (typically 3), so node_count=1 → 3 nodes/cluster, node_count=2 → 6 nodes/cluster, etc. The default 1 keeps zonal HA (1 node in each zone) while matching the per-cluster broker workload (2 broker pods + operator + cert-manager) — the previous default of 3 ran 9 nodes/cluster (27 across the stretch cluster) which is significantly over-provisioned for this validation."
   type        = number
-  default     = 3
+  default     = 1
 }
 
 variable "node_disk_size_gb" {
