@@ -784,13 +784,16 @@ PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
 
 **Step 6 — restore the primary, let auto-decommission retire the failover brokers**
 
-When us-east1 is back online, bring rp-east up:
+When us-east1 is back online, bring rp-east up — `kubectl scale sts redpanda-rp-east --replicas=2` if you simulated the failure with `replicas=0`, or just wait for the cluster to come back online if you simulated by deleting/stopping the underlying compute. Two new brokers join (IDs 7, 8) in rack `us-east1` and start picking up replicas — they're **new** broker IDs, not the old 0/1 that got decommissioned in step 5. The reason this works automatically: `additionalCmdFlags: ["--unbind-pvcs-after=120s", "--allow-pv-rebinding"]` in the helm values templates enables the operator's [PVCUnbinder controller](https://docs.redpanda.com/current/manage/kubernetes/k-nodewatcher/), which detects pods that stay `Pending` longer than the timeout (typical when the rp-east region was actually down — the broker pods couldn't schedule on the deleted nodes) and:
 
-```bash
-kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
-```
+1. Sets the affected `PersistentVolume`'s reclaim policy to `Retain`.
+2. Deletes the `PersistentVolumeClaim`.
 
-Two new brokers join (IDs 7, 8) in rack `us-east1` and start picking up replicas. Once `Under-replicated partitions: 0` again — meaning the cluster has spare capacity in rack `us-east1` for replicas to migrate to — you can let auto-decommission retire the temporary failover brokers by simply tearing down their infrastructure:
+So when rp-east comes back, the StatefulSet creates **fresh** PVCs (same `datadir-redpanda-rp-east-{0,1}` names) backed by **new** disks. Without PVCUnbinder, the broker pods come up bound to the old persistent disks, find their old `node_uuid` in `/var/lib/redpanda/data`, and try to rejoin the cluster as the previously-decommissioned IDs — which the cluster rejects with `bad_rejoin: trying to rejoin with same ID and UUID as a decommissioned node`. PVs orphaned by `--allow-pv-rebinding` need a separate cleanup pass; that's the tradeoff for emergency recovery being automatic.
+
+> ⚠ **Production caveat.** PVCUnbinder is "emergency only" per Redpanda's docs — any pod that stays `Pending` for the timeout duration loses its PV. For production, raise `--unbind-pvcs-after` substantially (so slow scheduler decisions / node-pool resizes / image-pull stalls don't trigger it) or remove the flag and accept manual recovery for region-loss scenarios.
+
+Once `Under-replicated partitions: 0` again — meaning the cluster has spare capacity in rack `us-east1` for replicas to migrate to — you can let auto-decommission retire the temporary failover brokers by simply tearing down their infrastructure:
 
 ```bash
 # 1. Remove the failover NodePool, then the operator + cert-manager helm releases.
