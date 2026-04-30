@@ -553,8 +553,6 @@ The 2 / 2 / 1 broker layout with `RF=5` survives a single-region outage in terms
 
 The operational fix is to **add capacity in a fourth, separate failover region**. As soon as the cluster has 5 reachable brokers again, re-replication unblocks, the autobalancer drains the two lost brokers, and the cluster returns to RF=5 across the new layout. This demo walks through the full sequence: simulate the regional failure, observe the stall, deploy the failover region, watch recovery, then restore the primary and decommission the failover.
 
-> ⚠ **More than just `kubectl` calls.** Unlike Demo A, this demo provisions a 4th K8s cluster (Terraform / `gcloud container clusters create` / `eksctl` / `az aks create`) and rolls a fresh helm release. Plan ~15-20 min of wall-clock and the additional infra cost while the failover region is up.
-
 **Step 1 — simulate the regional failure**
 
 ```bash
