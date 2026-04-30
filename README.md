@@ -110,6 +110,8 @@ terraform apply -var project_id=<your-gcp-project>     # GCP
 
 First apply takes ~15–25 minutes (control planes are the long pole; everything else is parallel).
 
+> **Azure side-note: 6 resource groups will appear, not 3.** Terraform creates one user RG per cluster (`rp-east-rg`, `rp-west-rg`, `rp-eu-rg`) holding the VNet, subnet, NSG, AKS control-plane resource pointer, and peer LB Service. AKS *also* auto-creates a sibling **node resource group** per cluster, named `MC_<parent-rg>_<cluster>_<region>` (so e.g. `MC_rp-east-rg_rp-east_eastus`), to hold the actual node VMSS, NICs, public IPs, internal LBs, and route table. You don't manage the `MC_*` RGs directly — AKS owns them, and they're torn down automatically when terraform deletes the AKS cluster resource. Don't be surprised by the 6 RGs in the portal; both sets are expected, and `az group list --query "[?contains(name, 'rp-')]"` will show them all.
+
 Register the three clusters as kubectl contexts named `rp-east`, `rp-west`, `rp-eu`:
 
 ```bash
