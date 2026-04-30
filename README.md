@@ -784,16 +784,26 @@ PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
 
 `rpk cluster health` reports `Healthy: true` and `Under-replicated partitions: 0`, and `partition_balancer/status` returns `"status": "ready"`.
 
-**Step 6 — restore the primary, let auto-decommission retire the failover brokers**
+**Step 6 — restore the primary, retire the failover brokers**
 
-When us-east1 is back online, bring rp-east up — `kubectl scale sts redpanda-rp-east --replicas=2` if you simulated the failure with `replicas=0`, or just wait for the cluster to come back online if you simulated by deleting/stopping the underlying compute. Two new brokers join (IDs 7, 8) in rack `us-east1` and start picking up replicas — they're **new** broker IDs, not the old 0/1 that got decommissioned in step 5. The reason this works automatically: `additionalCmdFlags: ["--unbind-pvcs-after=120s", "--allow-pv-rebinding"]` in the helm values templates enables the operator's [PVCUnbinder controller](https://docs.redpanda.com/current/manage/kubernetes/k-nodewatcher/), which detects pods that stay `Pending` longer than the timeout (typical when the rp-east region was actually down — the broker pods couldn't schedule on the deleted nodes) and:
+When us-east1 is back online, bring rp-east up. **What happens next depends on whether your simulation method destroyed the underlying disks**:
 
-1. Sets the affected `PersistentVolume`'s reclaim policy to `Retain`.
-2. Deletes the `PersistentVolumeClaim`.
+- **If the disks were destroyed** (you deleted the AKS cluster outright, terminated the VMSS instances + their managed disks, or otherwise broke the PV nodeAffinity), the new pods sit `Pending` while waiting for storage. After `--unbind-pvcs-after` (120 s by default), the operator's [PVCUnbinder controller](https://docs.redpanda.com/current/manage/kubernetes/k-nodewatcher/) deletes the dangling PVCs, the StatefulSet creates fresh ones, and the brokers boot cold and join as **new** IDs (7, 8). This is the happy path the chart's `additionalCmdFlags: ["--unbind-pvcs-after=120s", "--allow-pv-rebinding"]` default targets.
+- **If the disks survived** (e.g. you simulated with `az aks stop` + `az aks start`, EBS persistent across instance recovery, or anything else where the managed disk reattaches intact), PVCUnbinder will **NOT** fire — the pods aren't `Pending`, they're `Running 1/2` with the redpanda container in a restart loop because it found its old `node_uuid` in `/var/lib/redpanda/data` and tried to rejoin as a previously-decommissioned ID. The cluster rejects with `bad_rejoin: trying to rejoin with same ID and UUID as a decommissioned node` and the pod loops indefinitely. Recover manually:
 
-So when rp-east comes back, the StatefulSet creates **fresh** PVCs (same `datadir-redpanda-rp-east-{0,1}` names) backed by **new** disks. Without PVCUnbinder, the broker pods come up bound to the old persistent disks, find their old `node_uuid` in `/var/lib/redpanda/data`, and try to rejoin the cluster as the previously-decommissioned IDs — which the cluster rejects with `bad_rejoin: trying to rejoin with same ID and UUID as a decommissioned node`. PVs orphaned by `--allow-pv-rebinding` need a separate cleanup pass; that's the tradeoff for emergency recovery being automatic.
+  ```bash
+  # delete the bound PVCs (StorageClass reclaimPolicy: Delete reaps the disk)
+  kubectl --context rp-east -n redpanda delete pvc datadir-redpanda-rp-east-0 datadir-redpanda-rp-east-1
+  # force-evict the stuck pods so the StatefulSet recreates them with fresh PVCs
+  kubectl --context rp-east -n redpanda delete pod redpanda-rp-east-0 redpanda-rp-east-1 \
+    --grace-period=0 --force
+  ```
 
-> ⚠ **Production caveat.** PVCUnbinder is "emergency only" per Redpanda's docs — any pod that stays `Pending` for the timeout duration loses its PV. For production, raise `--unbind-pvcs-after` substantially (so slow scheduler decisions / node-pool resizes / image-pull stalls don't trigger it) or remove the flag and accept manual recovery for region-loss scenarios.
+  Tracked upstream as [redpanda-operator#1494](https://github.com/redpanda-data/redpanda-operator/issues/1494) — the multicluster operator's missing `decommissioning` controller would handle this automatically.
+
+Two new brokers (IDs 7, 8) join in rack `us-east1` and start picking up replicas. Once `Under-replicated partitions: 0` again — meaning the cluster has spare capacity in rack `us-east1` for replicas to migrate to — you can let auto-decommission retire the temporary failover brokers by tearing down their infrastructure (next step).
+
+> ⚠ **PVCUnbinder production caveat.** Per [Redpanda's docs](https://docs.redpanda.com/current/manage/kubernetes/k-nodewatcher/) it's "emergency only" — any pod that stays `Pending` for the timeout duration loses its PV. For production, raise `--unbind-pvcs-after` substantially or remove the flag entirely.
 
 Once `Under-replicated partitions: 0` again — meaning the cluster has spare capacity in rack `us-east1` for replicas to migrate to — you can let auto-decommission retire the temporary failover brokers by simply tearing down their infrastructure:
 

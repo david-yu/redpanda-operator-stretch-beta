@@ -36,13 +36,18 @@ multicluster:
     enabled: false
 
 # Operator-level PVCUnbinder: when a broker pod stays Pending longer than
-# `--unbind-pvcs-after` (typically because its node went away — e.g. AKS
-# `stop`/`start`, EC2 instance failure, GCE preemption), the operator
-# retains the PV and deletes the PVC so the StatefulSet can reschedule
-# the pod with a FRESH disk. Without this, brokers come back trying to
-# rejoin with their old (already-decommissioned) IDs and fail with
-# `bad_rejoin: trying to rejoin with same ID and UUID as a decommissioned node`.
-# Required for Demo B's "restore primary region" step to recover cleanly.
+# `--unbind-pvcs-after`, the operator retains the PV and deletes the PVC
+# so the StatefulSet can reschedule with a fresh disk. Triggers on real
+# storage loss — Node deletion that breaks PV nodeAffinity, hardware
+# failure, full AKS / EKS / GKE cluster recreate.
+#
+# It does NOT fire for `az aks stop`/`start` (or equivalent) where the
+# managed disks survive intact: the new pods bind to the same PVCs on
+# new nodes, never sit Pending, and instead crashloop on `bad_rejoin`
+# (the broker's persisted node_uuid was decommissioned). For that
+# scenario the recovery is manual `kubectl delete pvc + pod --force`,
+# tracked upstream as redpanda-operator#1494.
+#
 # Docs: https://docs.redpanda.com/current/manage/kubernetes/k-nodewatcher/
 #
 # WARNING: per Redpanda's docs, this is "emergency only". A pod that
