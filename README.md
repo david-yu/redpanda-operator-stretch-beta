@@ -403,21 +403,28 @@ Run both demos after step 9 (Quick test) on a healthy cluster.
 
 ### Demo A: ordered leader pinning + region-failover fallback
 
-The committed `stretchcluster.yaml` configures:
+The committed `<cloud>/manifests/stretchcluster.yaml` configures rack-aware leader pinning:
 
 ```yaml
 rackAwareness:
   enabled: true
-  nodeAnnotation: topology.kubernetes.io/region   # rack = AWS region
+  nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region
 
 config:
   cluster:
-    # Ordered preference: prefer us-east-1; if it's unavailable, fall back
-    # to us-west-2; only use eu-west-1 if both US regions are gone.
+    # Ordered preference. The leader balancer places partition leaders in the
+    # FIRST listed rack with available brokers; if every broker in that rack
+    # is unreachable, it falls through to the next, and so on.
+    # The rack list is cloud-specific:
+    #   AWS:   racks:us-east-1,us-west-2,eu-west-1
+    #   GCP:   racks:us-east1,us-west1,us-east4
+    #   Azure: racks:eastus,westus2,westeurope
     default_leaders_preference: "racks:us-east-1,us-west-2,eu-west-1"
 ```
 
-Each broker reads the K8s node's `topology.kubernetes.io/region` label and uses it as its rack — so brokers end up in racks `us-east-1`, `us-west-2`, `eu-west-1` (one rack per region). Verify:
+Each broker reads its K8s node's `topology.kubernetes.io/region` label and uses it as its rack — so brokers end up tagged with the region they live in (one rack per region). The five steps below use AWS region names as a concrete example; substitute your cloud's names when you read the outputs.
+
+**Step 1 — verify rack labels are populated**
 
 ```bash
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
@@ -435,7 +442,9 @@ ID    HOST                         PORT   RACK       CORES  MEMBERSHIP  IS-ALIVE
 4     redpanda-rp-west-1.redpanda  33145  us-west-2  1      active      true      26.1.6
 ```
 
-**Show preference 1 working** — create a topic with 12 partitions and watch leadership concentrate on `us-east-1` brokers:
+**Step 2 — create the demo topic and watch leaders concentrate in the rank-1 rack**
+
+Create a 12-partition topic with RF=5 (so every partition has a replica on every broker):
 
 ```bash
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
@@ -447,13 +456,15 @@ TOPIC                STATUS
 leader-pinning-demo  OK
 ```
 
+Wait ~60 s for the leader balancer to converge, then describe partitions:
+
 ```bash
-sleep 60   # let the leader balancer converge
+sleep 60
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk topic describe leader-pinning-demo -p
 ```
 
-Expected partition table — every replica list contains all 5 brokers (RF=5), and every leader is broker 0 or 1:
+Expected — every replica list contains all 5 brokers, and every leader is broker 0 or 1 (the two rank-1 brokers in `us-east-1`):
 
 ```
 PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
@@ -483,9 +494,11 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
    6 1
 ```
 
-— all 12 leaders on the two `us-east-1` brokers (preference 1), evenly split.
+— all 12 leaders on the two `us-east-1` brokers (rank 1), evenly split.
 
-**Show fallback when us-east-1 goes down** — scale the rp-east StatefulSet to 0:
+**Step 3 — simulate the rank-1 region failing**
+
+Scale the rp-east StatefulSet to 0:
 
 ```bash
 kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
@@ -495,16 +508,17 @@ kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
 statefulset.apps/redpanda-rp-east scaled
 ```
 
-```bash
-# Wait ~90s for brokers to terminate, partitions to re-replicate, and the
-# leader balancer to converge on the next-priority rack.
-sleep 90
+**Step 4 — confirm leaders fall through to the rank-2 rack**
 
+Wait ~90 s for brokers to terminate, partitions to re-replicate, and the leader balancer to converge on the next-priority rack:
+
+```bash
+sleep 90
 kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
   rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
 ```
 
-Expected — leaders migrate off brokers 0+1 to brokers 3+4 (`us-west-2`, preference 2):
+Expected — leaders migrate off brokers 0 + 1 to brokers 3 + 4 (`us-west-2`, rank 2):
 
 ```
    6 3
@@ -519,9 +533,9 @@ If during a transition you see something like:
    4 4
 ```
 
-that's the leader balancer mid-convergence — broker 2 (`eu-west-1`, preference 3) was used as a temporary holder for partitions whose preferred replicas were not yet caught up. Wait another 30–60s and re-tally; leadership consolidates on `us-west-2` once partitions are re-replicated there.
+that's the leader balancer mid-convergence — broker 2 (`eu-west-1`, rank 3) was used as a temporary holder for partitions whose preferred replicas weren't yet caught up. Wait another 30–60 s and re-tally; leadership consolidates on `us-west-2` once partitions are re-replicated there.
 
-**Restore us-east-1**:
+**Step 5 — restore the primary and watch leaders return**
 
 ```bash
 kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
@@ -531,16 +545,21 @@ kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
 statefulset.apps/redpanda-rp-east scaled
 ```
 
+Brokers rejoin (~60 s), partitions catch up, the leader balancer moves leaders back to `us-east-1` (rank 1). After ~2 min:
+
 ```bash
-# Brokers rejoin (~60s), partitions catch up, leader balancer moves leaders
-# back to us-east-1 (preference 1). Expect:
-#    6 0
-#    6 1
+kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+  rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
 ```
 
-A few caveats observed during validation:
+```
+   6 0
+   6 1
+```
 
-- The leader balancer **stalls during under-replicated periods** — when half a region's brokers go away, it pauses while the cluster is recovering, then resumes once partitions are re-replicated. Expect 30–90s of "leaders not yet on us-west-2" while replicas are being rebuilt elsewhere.
+**Caveats observed during validation:**
+
+- The leader balancer **stalls during under-replicated periods** — when half a region's brokers go away, it pauses while the cluster is recovering, then resumes once partitions are re-replicated. Expect 30–90 s of "leaders not yet on the rank-2 rack" while replicas are being rebuilt elsewhere.
 - Cross-region heartbeats can flap during transitions — `rpk redpanda admin brokers list` may briefly show un-affected brokers as `IS-ALIVE=false`. Confirm against `rpk cluster health` (`Nodes down:` field) which uses the controller's authoritative view.
 
 ### Demo B: regional failure + temporary failover-region capacity injection
