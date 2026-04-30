@@ -982,6 +982,6 @@ kubectl --context <c> -n redpanda delete pod redpanda-<pool>-0 --grace-period=0 
 
 - **AWS**: 3× EKS control plane + 9× m5.xlarge + 3× internal NLB + TGW (3 attachments + 3 inter-region peerings) ≈ **$2.10/hr** at on-demand pricing, plus inter-region data transfer.
 - **GCP**: 3× regional GKE control plane @ $0.10/hr ($0.30/hr) + 27× n2-standard-4 @ $0.1942/hr ($5.24/hr — regional clusters spread `node_count=3` across 3 zones, so 9 VMs per cluster × 3 clusters) + 27× 50 GB pd-balanced boot disks ($0.18/hr) + 3× internal Passthrough Network LB forwarding rules @ $0.025/hr ($0.075/hr) + 3× Cloud NAT gateway @ $0.045/hr ($0.135/hr) + Cloud Router (free) ≈ **$5.93/hr** at on-demand pricing, plus inter-region egress (charged per GB).
-- **Azure**: 3× AKS control plane (free with paid SKU) + 9× Standard_D4s_v5 (~$0.19/hr each) + 3× internal Standard LB ≈ **~$1.80/hr**, plus VNet peering + cross-region transfer.
+- **Azure**: 3× AKS control plane (Free tier, no charge) + 6× Standard_D4s_v5 @ $0.192/hr ($1.15/hr — `node_count=2` per cluster × 3 clusters; bump only if your subscription's regional vCPU quota for the DSv5 family allows it, default sandbox is 10/region) + 6× ~64 GB Premium SSD OS disks @ $0.00525/hr ($0.03/hr) + 3× Standard Public IP for AKS outbound NAT @ $0.005/hr ($0.015/hr) + 6× internal Standard LB forwarding rules (1 outbound + 1 peer-Service per cluster — first 5 rules per LB free at idle) ≈ **$1.20/hr** at on-demand pricing, plus inter-region VNet peering egress (charged per GB).
 
 Tear down promptly when validation is done.
