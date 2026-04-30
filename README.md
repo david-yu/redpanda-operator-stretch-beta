@@ -199,7 +199,7 @@ done
 wait
 ```
 
-Note the **helm release name == cluster context name**. This makes the chart's `operator.Fullname` equal the context name, which keeps the bootstrap-created TLS Secret name (`<ctx>-multicluster-certificates`) aligned with what the chart looks up. Avoids the trap of needing `--name-override` (which collides peer names — see issue 4).
+Note the **helm release name == cluster context name**. This makes the chart's `operator.Fullname` equal the context name, which keeps the bootstrap-created TLS Secret name (`<ctx>-multicluster-certificates`) aligned with what the chart looks up. Avoids the trap of needing `--name-override` (which collides peer names — see [Troubleshooting](#troubleshooting) issue 3).
 
 Confirm:
 
@@ -211,7 +211,7 @@ You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, 
 
 ### 5. cert-manager per cluster
 
-Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources — without it, broker pods stay stuck in `Init` waiting for the leaf-cert Secrets to appear (see [Troubleshooting](#troubleshooting) issue 6). cert-manager is independent of steps 1–4 and can be installed any time before step 6 (in parallel if you want to save wall-clock time).
+Required because `tls.enabled: true` on the StretchCluster spec triggers the operator to create cert-manager `Certificate` and `Issuer` resources — without it, broker pods stay stuck in `Init` waiting for the leaf-cert Secrets to appear (see [Troubleshooting](#troubleshooting) issue 5). cert-manager is independent of steps 1–4 and can be installed any time before step 6 (in parallel if you want to save wall-clock time).
 
 ```bash
 helm repo add jetstack https://charts.jetstack.io --force-update && helm repo update
@@ -246,7 +246,7 @@ kubectl --context rp-west -n redpanda apply -f <cloud>/manifests/nodepool-rp-wes
 kubectl --context rp-eu   -n redpanda apply -f <cloud>/manifests/nodepool-rp-eu.yaml
 ```
 
-The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). See [Troubleshooting](#troubleshooting) issues 7–8 for the why behind each.
+The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). See [Troubleshooting](#troubleshooting) issues 6–7 for the why behind each.
 
 ### 7. Wait for green
 
@@ -287,7 +287,7 @@ ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VER
 2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      26.1.6
 ```
 
-If `rpk multicluster status` looks healthy but `brokers list` doesn't show all the expected brokers, suspect a broker-network problem (firewall/SG missing port 33145, or `crossClusterMode` not set to `flat`); see [Troubleshooting](#troubleshooting) issues 7 and 10.
+If `rpk multicluster status` looks healthy but `brokers list` doesn't show all the expected brokers, suspect a broker-network problem (firewall/SG missing port 33145, or `crossClusterMode` not set to `flat`); see [Troubleshooting](#troubleshooting) issues 6 and 9.
 
 ### 9. Quick test — produce and consume across clusters
 
@@ -321,7 +321,7 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
 # Expect TOTAL-LAG=0 and per-partition CURRENT-OFFSET == LOG-END-OFFSET.
 ```
 
-If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection refused`, jump to issue 10 below — it's almost always a missing firewall/SG rule.
+If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection refused`, jump to issue 9 below — it's almost always a missing firewall/SG rule.
 
 ## Optional demos
 
@@ -812,15 +812,11 @@ gcloud compute firewall-rules describe redpanda-stretch-validation-cross-cluster
 az network nsg rule list -g <c>-rg --nsg-name <c>-nsg -o table
 ```
 
-### 3. LB ends up internet-facing instead of internal
-
-Bootstrap with `--loadbalancer` creates a vanilla `LoadBalancer` Service without cloud-specific annotations. The CLI has no `--annotations` flag; the underlying `PeerLoadBalancerConfig.Annotations` field is never populated from the CLI. **Pre-create the Service** with the right cloud-specific annotation (Terraform's `peer_services.tf` does this for you on every cloud — `aws-load-balancer-scheme: internal` for AWS, `networking.gke.io/load-balancer-type: Internal` for GCP, `azure-load-balancer-internal: "true"` for Azure), then run bootstrap — `controllerutil.CreateOrUpdate` reuses the existing Service and preserves your annotations.
-
-### 4. Operator pods crashloop after install with "duplicate peer name" / raft can't form
+### 3. Operator pods crashloop after install with "duplicate peer name" / raft can't form
 
 Symptom: bootstrap output shows all peers with `name: redpanda-operator` (or whatever you passed to `--name-override`). The chart renders `--peer=<same>://addr1 --peer=<same>://addr2 --peer=<same>://addr3` and raft can't disambiguate. Fix: drop `--name-override` and use **per-cluster helm release names equal to the context name** plus `fullnameOverride: <ctx>` in values. The cluster.Name then carries the context name (unique) and the cert Secret name (`<ctx>-multicluster-certificates`) lines up with what the chart looks for via `operator.Fullname`.
 
-### 5. helm install fails: "apiServerExternalAddress must be specified in multicluster mode"
+### 4. helm install fails: "apiServerExternalAddress must be specified in multicluster mode"
 
 Chart template-time check. Set it in values:
 
@@ -840,11 +836,11 @@ gcloud container clusters describe <c> --region <r> --format='value(endpoint)'
 az aks show -n <c> -g <c>-rg --query fqdn -o tsv
 ```
 
-### 6. Broker pods stuck `Init:0/3` with "MountVolume.SetUp failed for volume redpanda-default-cert: secret not found"
+### 5. Broker pods stuck `Init:0/3` with "MountVolume.SetUp failed for volume redpanda-default-cert: secret not found"
 
-The operator created `redpanda-default-root-certificate` (CA) and the cert-manager `Certificate`/`Issuer` resources, but cert-manager itself isn't installed, so the leaf cert Secrets `redpanda-default-cert` and `redpanda-external-cert` never exist. Install cert-manager (step 4 above), then either wait or force-replace the stuck pods (`kubectl delete pod redpanda-<pool>-0 --grace-period=0 --force`) so kubelet retries the mount.
+The operator created `redpanda-default-root-certificate` (CA) and the cert-manager `Certificate`/`Issuer` resources, but cert-manager itself isn't installed, so the leaf cert Secrets `redpanda-default-cert` and `redpanda-external-cert` never exist. Install cert-manager (step 5 above), then either wait or force-replace the stuck pods (`kubectl delete pod redpanda-<pool>-0 --grace-period=0 --force`) so kubelet retries the mount.
 
-### 7. Brokers running but never become Ready (cluster_discovery loop)
+### 6. Brokers running but never become Ready (cluster_discovery loop)
 
 Broker logs spam:
 ```
@@ -861,19 +857,19 @@ spec:
 
 In flat mode the operator renders headless Services and manages EndpointSlices with peer pod IPs from across clusters, so DNS in any cluster resolves `redpanda-rp-west-0.redpanda` to the actual pod IP via your cloud's L3 path.
 
-### 8. `flat` mode set but per-pool Services for remote pools don't exist
+### 7. `flat` mode set but per-pool Services for remote pools don't exist
 
 Symptom: `kubectl get svc -n redpanda` in `rp-east` shows only `redpanda-rp-east-0`, not `redpanda-rp-west-0` or `redpanda-rp-eu-0`. The operator skips rendering for remote pools when `services.perPod.remote.enabled: false`. Set it to `true` in every NodePool.
 
-### 9. StretchCluster `ResourcesSynced=False`: "spec.clusterIPs[0]: Invalid value: ['None']: may not change once set"
+### 8. StretchCluster `ResourcesSynced=False`: "spec.clusterIPs[0]: Invalid value: ['None']: may not change once set"
 
-The operator wants to convert per-pod Services to headless (clusterIP=None) for flat mode, but K8s doesn't allow changing `spec.clusterIP` after creation. Delete the affected Services (`kubectl delete svc redpanda-rp-{east,west,eu}-0 -n redpanda` on every cluster); the operator immediately recreates them headless on the next reconcile.
+Upgrade-only. The operator wants to convert per-pod Services to headless (clusterIP=None) for flat mode, but K8s doesn't allow changing `spec.clusterIP` after creation, so this only triggers when migrating an existing deploy from non-flat to flat (fresh deploys from this repo's manifests come up headless on first reconcile and never hit it). Delete the affected Services (`kubectl delete svc redpanda-rp-{east,west,eu}-0 -n redpanda` on every cluster); the operator immediately recreates them headless on the next reconcile.
 
-### 10. `rpk topic create` from inside a broker pod hangs / "i/o timeout" on port 9093
+### 9. `rpk topic create` from inside a broker pod hangs / "i/o timeout" on port 9093
 
 Kafka client port `9093` (and Pandaproxy `8082`, Admin `9644`) are not open across cluster CIDRs in firewall/NSG rules by default — many setup guides only mention the broker RPC port `33145`. The Terraform in this repo opens all five via the `cross_cluster_ports` variable on every cloud (see `aws/terraform/sg.tf`, `gcp/terraform/firewall.tf`, `azure/terraform/nsg.tf`).
 
-### 11. PVC `Pending`: "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims"
+### 10. PVC `Pending`: "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims"
 
 Cluster has no default StorageClass. Cloud-specific defaults:
 - **AWS / EKS**: newer EKS doesn't ship `gp2` annotated default — `aws/terraform/eks.tf` patches `gp2` as default automatically.
@@ -884,18 +880,6 @@ If the PVC was created **before** the default class annotation existed, delete t
 ```bash
 kubectl --context <c> -n redpanda delete pvc datadir-redpanda-<pool>-0
 kubectl --context <c> -n redpanda delete pod redpanda-<pool>-0 --grace-period=0 --force
-```
-
-### 12. Bootstrap reports old peer addresses after re-running
-
-`rpk k8s multicluster bootstrap` is idempotent. If you change the per-cluster Service name (e.g. moved from `redpanda-operator-multicluster-peer` to `<ctx>-multicluster-peer`), the previous bootstrap's TLS Secret and kubeconfig Secrets remain in the namespace under their old names. Clean them up explicitly before re-running:
-
-```bash
-for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" -n redpanda delete secret \
-    --selector=operator.redpanda.com/bootstrap-managed=true 2>/dev/null
-  # And anything matching your old prefix
-done
 ```
 
 ## Cost (running)
