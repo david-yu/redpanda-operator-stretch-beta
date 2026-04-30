@@ -702,7 +702,17 @@ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu 
 # Expect PEERS=4, UNHEALTHY=0, all 4 cross-cluster checks ✓
 ```
 
-**Step 5 — watch recovery (~5–10 min)**
+**Step 5 — watch the auto-decommission of brokers 0 and 1 finish (~5–10 min)**
+
+You don't need to issue any `rpk redpanda admin brokers decommission` here. The autobalancer **already issued the decommission for the unreachable brokers in step 1** — that's why broker 1 shows `MEMBERSHIP=draining` in step 1's output. The drain just couldn't make progress because RF=5 with only 3 reachable brokers had nowhere to land the replicas (`partition_balancer/status: "stalled"`). Now that rp-failover added two reachable brokers, the stall clears, the existing drain resumes, and the autobalancer issues a decom for broker 0 next:
+
+| Phase | What the autobalancer is doing |
+|---|---|
+| step 1 (t≈30s)  | brokers 0, 1 marked `IS-ALIVE=false` after `partition_autobalancing_node_availability_timeout_sec` (30s) |
+| step 1 (t≈90s)  | decommission issued for broker 1 (or broker 0 — autobalancer drains one at a time) → enters `draining` |
+| step 1 → step 4 | drain stalled; status flips to `"stalled"` because RF=5 has nowhere to rebuild replicas |
+| step 4 done    | brokers 5, 6 join; 5 reachable brokers → autobalancer status flips back to `"ready"` |
+| step 5 onward  | drain resumes on broker 1, completes, broker 1 evicted; decom issued for broker 0; same cycle |
 
 ```bash
 for i in $(seq 1 30); do
@@ -713,20 +723,20 @@ for i in $(seq 1 30); do
 done
 ```
 
-Expected progression:
+Expected progression (no manual `decommission` calls — every state change below is the partition autobalancer acting on its own once capacity is back):
 
 ```
---- T+0:00 ---       # rp-failover brokers (5, 6) just joined; brokers 0, 1 still stuck
-0 us-east1     active   false
-1 us-east1     draining false
+--- T+0:00 ---       # rp-failover brokers (5, 6) just joined; broker 1's existing decom
+0 us-east1     active   false           # was queued from step 1 but stalled.
+1 us-east1     draining false           # ↑ autobalancer about to un-stall
 2 us-east4     active   true
 3 us-west1     active   true
 4 us-west1     active   true
 5 us-central1  active   true
 6 us-central1  active   true
 
---- T+5:00 ---       # autobalancer un-stalled (5 reachable brokers); drain progressing
-0 us-east1     draining false
+--- T+5:00 ---       # autobalancer un-stalled — drain on broker 1 progresses;
+0 us-east1     draining false           # decommission issued for broker 0 (next unavailable).
 1 us-east1     draining false
 2 us-east4     active   true
 3 us-west1     active   true
