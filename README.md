@@ -723,7 +723,7 @@ done
 ## Cost (running)
 
 - **AWS**: 3× EKS control plane + 9× m5.xlarge + 3× internal NLB + TGW (3 attachments + 3 inter-region peerings) ≈ **$2.10/hr** at on-demand pricing, plus inter-region data transfer.
-- **GCP**: 3× regional GKE control plane (free below 1 zonal cluster, ~$0.10/hr above) + 9× n2-standard-4 (~$0.19/hr each) + 3× internal LB (negligible idle) + 3× Cloud NAT + Router ≈ **~$2.00/hr**, plus inter-region egress.
+- **GCP**: 3× regional GKE control plane @ $0.10/hr ($0.30/hr) + 27× n2-standard-4 @ $0.1942/hr ($5.24/hr — regional clusters spread `node_count=3` across 3 zones, so 9 VMs per cluster × 3 clusters) + 27× 50 GB pd-balanced boot disks ($0.18/hr) + 3× internal Passthrough Network LB forwarding rules @ $0.025/hr ($0.075/hr) + 3× Cloud NAT gateway @ $0.045/hr ($0.135/hr) + Cloud Router (free) ≈ **$5.93/hr** at on-demand pricing, plus inter-region egress (charged per GB).
 - **Azure**: 3× AKS control plane (free with paid SKU) + 9× Standard_D4s_v5 (~$0.19/hr each) + 3× internal Standard LB ≈ **~$1.80/hr**, plus VNet peering + cross-region transfer.
 
 Tear down promptly when validation is done.
