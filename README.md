@@ -547,76 +547,75 @@ kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
 }
 ```
 
-**Step 3 — provision a fourth K8s cluster (rp-failover)**
+**Step 3 — provision a fourth K8s cluster + cross-region networking (rp-failover)**
 
-Pick a healthy region distinct from the three existing ones — e.g. `us-central1` for GCP — and create a 4th GKE cluster on the same VPC. The simplest path is to extend the terraform `clusters` map (preferred for repeatability), but you can also one-shot it with `gcloud` for a true emergency response:
+The failover region needs three things: (a) a K8s cluster reachable from the existing clusters' pod CIDRs, (b) cross-region L3 routing extended to the failover pod CIDR, and (c) a pre-created internal-LB peer Service in the `redpanda` namespace. Each cloud provides a dedicated terraform stack that does all three; pick yours below. CIDRs in each stack default to non-overlapping ranges (`10.40.x.x` / `10.140.x.x` / `10.141.x.x` for failover) so it can be applied on top of the main stack without conflicts.
+
+| Cloud | Failover terraform | What it does |
+|---|---|---|
+| **GCP / GKE** | [`gcp/terraform-failover/`](gcp/terraform-failover/README.md) | Looks up the existing global VPC by name, adds a 4th subnet + Cloud Router/NAT, creates a 4th GKE cluster, and adds an additive firewall rule that includes the failover pod CIDR. **Validated.** |
+| **AWS / EKS** | [`aws/terraform-failover/`](aws/terraform-failover/README.md) | New VPC + EKS cluster, new TGW attachment, three TGW peering attachments (failover ↔ each existing region), route-table updates, SG rules. **Skeleton — recipe + manual `eksctl` fallback in the directory README.** |
+| **Azure / AKS** | [`azure/terraform-failover/`](azure/terraform-failover/README.md) | New resource group + VNet + AKS cluster, six VNet peerings (failover ↔ each existing VNet, both directions), NSG rules. **Skeleton — recipe + manual `az aks create` fallback in the directory README.** |
 
 ```bash
-# Pick a non-overlapping subnet/pods/services CIDR triple
-gcloud container clusters create rp-failover \
-  --region us-central1 \
-  --network <existing-vpc> \
-  --create-subnetwork name=rp-failover-subnet,range=10.40.0.0/20 \
-  --cluster-ipv4-cidr 10.140.0.0/16 \
-  --services-ipv4-cidr 10.141.0.0/20 \
-  --release-channel rapid --machine-type n2-standard-4 --num-nodes 3 \
-  --workload-pool=<project>.svc.id.goog \
-  --project <project>
+# GCP — fully working, ~10–12 min
+cd gcp/terraform-failover
+terraform init
+terraform apply -var project_id=<your-gcp-project>
+terraform output -raw failover_kubectl_setup_command | bash    # registers context: rp-failover
+terraform output failover_peer_lb_address                       # for multicluster.peers
+terraform output -raw failover_gke_endpoint                     # for multicluster.apiServerExternalAddress
 
-gcloud container clusters get-credentials rp-failover --region us-central1 --project <project>
-kubectl config rename-context gke_<project>_us-central1_rp-failover rp-failover
+# AWS / Azure — until the .tf is checked in, follow the recipe in
+#   aws/terraform-failover/README.md  or  azure/terraform-failover/README.md
 ```
 
-The new region's cross-cluster firewall rule must allow the same five ports (`9443, 33145, 9093, 8082, 9644`) from/to all four pod CIDRs. Update the existing `redpanda-stretch-validation-cross-cluster` rule's `source_ranges` and `target_tags` to include rp-failover's pod CIDR.
+**Step 4 — bootstrap, install, apply manifests on the failover cluster (cloud-agnostic)**
 
-**Step 4 — bootstrap the new cluster into the multicluster, install operator + cert-manager, apply the StretchCluster + a 2-broker NodePool**
+Once the rp-failover context is registered and the failover region's pod CIDR is reachable from the other three regions, the rest of the flow is identical to the original 3-cluster bring-up — just run it for the new cluster and update peer lists.
 
 ```bash
-# 1. Create the redpanda namespace + pre-create the peer LB Service
-kubectl --context rp-failover create ns redpanda
-kubectl --context rp-failover -n redpanda apply -f - <<'EOF'
-apiVersion: v1
-kind: Service
-metadata:
-  name: rp-failover-multicluster-peer
-  namespace: redpanda
-  annotations:
-    networking.gke.io/load-balancer-type: Internal
-spec:
-  type: LoadBalancer
-  ports: [{ port: 9443, targetPort: 9443 }]
-  selector: { app.kubernetes.io/name: operator, app.kubernetes.io/instance: rp-failover }
-EOF
+# Capture the addresses for the helm values templates (output names depend on the cloud:
+# AWS uses peer hostnames, GCP/Azure use IPs)
+RP_FAILOVER_API=$(terraform output -raw failover_gke_endpoint)
+RP_FAILOVER_LB=$(terraform output -raw failover_peer_lb_address)
 
-# 2. Bootstrap multicluster (idempotent — re-runs preserve existing TLS state)
+# 1. Bootstrap multicluster including the new cluster (idempotent — existing TLS state is preserved).
 rpk k8s multicluster bootstrap \
   --context rp-east --context rp-west --context rp-eu --context rp-failover \
-  --namespace redpanda --loadbalancer
+  --namespace redpanda --loadbalancer --loadbalancer-timeout 10m
 
-# 3. Install cert-manager + operator on the new cluster
-helm --kube-context rp-failover upgrade --install cert-manager jetstack/cert-manager \
-  --namespace cert-manager --create-namespace --version v1.17.2 \
-  --set crds.enabled=true --wait
+# 2. Render an rp-failover values file from the existing template.
+#    Edit /tmp/values-rp-failover.yaml to set:
+#      multicluster.name: rp-failover
+#      multicluster.apiServerExternalAddress: $RP_FAILOVER_API
+#      multicluster.peers: 4 entries (rp-east, rp-west, rp-eu, rp-failover with $RP_FAILOVER_LB)
+cp <cloud>/helm-values/values-rp-east.example.yaml /tmp/values-rp-failover.yaml
+# (then sed/edit as above)
 
+# 3. Update the OTHER three clusters' values to list 4 peers, helm upgrade so they learn the new peer.
+#    /tmp/values-rp-{east,west,eu}.yaml → add the rp-failover peer entry, then:
+for C in rp-east rp-west rp-eu; do
+  helm --kube-context "$C" upgrade "$C" redpanda/operator \
+    --namespace redpanda --version 26.2.1-beta.1 --devel \
+    -f /tmp/values-${C}.yaml --wait --timeout 5m
+done
+
+# 4. License Secret + cert-manager + operator on rp-failover
 kubectl --context rp-failover -n redpanda create secret generic redpanda-license \
   --from-file=license.key="$RP_LICENSE" --dry-run=client -o yaml \
   | kubectl --context rp-failover apply -f -
 
-# Render a values file for rp-failover — same shape as the others, with the new
-# cluster's API server endpoint and a 4-entry peers list.
+helm --kube-context rp-failover upgrade --install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace --version v1.17.2 \
+  --set crds.enabled=true --wait --timeout 5m
+
 helm --kube-context rp-failover upgrade --install rp-failover redpanda/operator \
   --namespace redpanda --version 26.2.1-beta.1 --devel \
   -f /tmp/values-rp-failover.yaml --wait --timeout 5m
 
-# 4. Update the OTHER three clusters' values files to also list 4 peers, then helm upgrade
-for C in rp-east rp-west rp-eu; do
-  helm --kube-context "$C" upgrade "$C" redpanda/operator \
-    --namespace redpanda --version 26.2.1-beta.1 --devel \
-    -f /tmp/values-${C}.yaml --reuse-values=false
-done
-
-# 5. Apply the StretchCluster spec + a 2-broker NodePool on the failover cluster
-kubectl --context rp-failover -n redpanda apply -f gcp/manifests/stretchcluster.yaml
+# 5. StretchCluster + a 2-broker NodePool on the failover cluster (use your cloud's manifests/)
+kubectl --context rp-failover -n redpanda apply -f <cloud>/manifests/stretchcluster.yaml
 cat <<'EOF' | kubectl --context rp-failover -n redpanda apply -f -
 apiVersion: cluster.redpanda.com/v1alpha2
 kind: NodePool
@@ -627,6 +626,13 @@ spec:
   image: { repository: redpandadata/redpanda, tag: v26.1.6 }
   services: { perPod: { remote: { enabled: true } } }
 EOF
+```
+
+Confirm the operator joined the multicluster cleanly:
+
+```bash
+rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu --context rp-failover --namespace redpanda
+# Expect PEERS=4, UNHEALTHY=0, all 4 cross-cluster checks ✓
 ```
 
 **Step 5 — watch recovery (~5–10 min)**
@@ -680,7 +686,7 @@ PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
 
 `rpk cluster health` reports `Healthy: true` and `Under-replicated partitions: 0`, and `partition_balancer/status` returns `"status": "ready"`.
 
-**Step 6 — restore the primary, decommission the failover**
+**Step 6 — restore the primary, let auto-decommission retire the failover brokers**
 
 When us-east1 is back online, bring rp-east up:
 
@@ -688,27 +694,43 @@ When us-east1 is back online, bring rp-east up:
 kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
 ```
 
-Two new brokers join (IDs 7, 8) in rack `us-east1` and start picking up replicas. Once `Under-replicated partitions: 0` again, drain the temporary failover brokers and tear down rp-failover:
+Two new brokers join (IDs 7, 8) in rack `us-east1` and start picking up replicas. Once `Under-replicated partitions: 0` again — meaning the cluster has spare capacity in rack `us-east1` for replicas to migrate to — you can let auto-decommission retire the temporary failover brokers by simply tearing down their infrastructure:
 
 ```bash
-# Drain failover brokers 5 and 6
-for ID in 5 6; do
-  kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
-    rpk redpanda admin brokers decommission "$ID"
-done
-
-# Wait for both to leave the roster (poll `rpk redpanda admin brokers list`)
-
-# Then remove the rp-failover region
+# 1. Remove the failover NodePool, then the operator + cert-manager helm releases.
 kubectl --context rp-failover -n redpanda delete nodepool rp-failover
 helm --kube-context rp-failover uninstall rp-failover -n redpanda
 helm --kube-context rp-failover uninstall cert-manager -n cert-manager
-gcloud container clusters delete rp-failover --region us-central1
+
+# 2. Destroy the failover infrastructure.
+cd <aws|gcp|azure>/terraform-failover && terraform destroy
+# (or `gcloud container clusters delete rp-failover --region us-central1` if you used the manual path)
 ```
 
-Don't forget to **revert the four-cluster `multicluster.peers` lists back to three** in each surviving cluster's helm values, and `helm upgrade` so rp-east, rp-west, rp-eu stop trying to peer with the deleted cluster.
+Brokers 5 and 6 become unreachable as their pods + nodes go away; after `partition_autobalancing_node_availability_timeout_sec` (30 s) the controller marks them unavailable, and after `partition_autobalancing_node_autodecommission_timeout_sec` (60 s) the partition autobalancer issues the decommission. **This works now because the cluster has 5 reachable brokers** (the 2 new us-east1 + 1 us-east4 + 2 us-west1) so RF=5 re-replication is possible — the same precondition that step 3's capacity injection unblocked. Watch the eviction:
 
-The cluster ends back at the original 2 / 2 / 1 layout — 2 brokers in us-east1 (new IDs 7, 8 in place of the original 0, 1), 2 in us-west1 (3, 4), 1 in us-east4 (2). Quorum properties and rack-leader preferences are restored.
+```bash
+for i in $(seq 1 10); do
+  echo "--- $(date +%T) ---"
+  kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
+    rpk redpanda admin brokers list | awk 'NR>1 {print $1, $4, $6, $7}'
+  sleep 30
+done
+```
+
+Expected — brokers 5 and 6 transition `active false → draining false → (gone)`, and final state is the original 2 / 2 / 1 layout with new IDs:
+
+```
+2 us-east4  active true     # the original eu broker, untouched
+3 us-west1  active true
+4 us-west1  active true
+7 us-east1  active true     # newly-joined replacements for the lost brokers 0, 1
+8 us-east1  active true
+```
+
+You can fall back to **manual decommission** (`rpk redpanda admin brokers decommission 5; rpk redpanda admin brokers decommission 6`) before tearing down the infrastructure if you want to drain replicas off the failover brokers *while they're still reachable* — useful for clean operational handoffs (e.g. you're keeping rp-failover provisioned but reverting the cluster to 3-region). Auto-decommission is the simpler default for the "rp-east is back, throw away the temporary capacity" case shown above.
+
+**Final cleanup:** revert the four-cluster `multicluster.peers` lists back to three in each surviving cluster's helm values and `helm upgrade` so rp-east, rp-west, rp-eu stop trying to reach the deleted peer. The cluster ends at the original 2 / 2 / 1 layout — 2 brokers in us-east1 (new IDs 7, 8), 2 in us-west1 (3, 4), 1 in us-east4 (2). Quorum properties and rack-leader preferences are restored.
 
 **Important caveats observed during validation:**
 
