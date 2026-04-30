@@ -10,7 +10,7 @@ variable "project_name" {
 }
 
 variable "kubernetes_version" {
-  description = "GKE control plane release channel — let the channel pick the version."
+  description = "GKE release channel — RAPID tracks the latest GA minor (~1.35.x at time of writing), REGULAR is ~1 minor behind, STABLE is ~2-3 minor behind. The channel auto-picks and auto-upgrades the patch version, so this terraform doesn't pin a specific 1.x.y."
   type        = string
   default     = "RAPID"
   validation {

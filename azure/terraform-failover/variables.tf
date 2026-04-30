@@ -7,7 +7,7 @@ variable "project_name" {
 variable "kubernetes_version" {
   description = "AKS Kubernetes version — match the main stack."
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "vm_size" {

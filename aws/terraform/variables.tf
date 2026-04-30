@@ -11,9 +11,9 @@ variable "owner" {
 }
 
 variable "kubernetes_version" {
-  description = "EKS Kubernetes version."
+  description = "EKS Kubernetes version. Should be on EKS standard support — `aws eks describe-cluster-versions --region <region> --query 'clusterVersions[?versionStatus==\\`STANDARD_SUPPORT\\`].clusterVersion' --output text` lists what's available. EKS adds new versions 1-2 months after upstream GA and rolls older ones to extended-support periodically; bump when that happens."
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "node_instance_type" {

@@ -13,7 +13,7 @@ variable "owner" {
 variable "kubernetes_version" {
   description = "EKS Kubernetes version — match the main stack."
   type        = string
-  default     = "1.31"
+  default     = "1.34"
 }
 
 variable "node_instance_type" {
