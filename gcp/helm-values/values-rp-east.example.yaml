@@ -1,0 +1,36 @@
+# Helm values for cluster rp-east. Each cluster gets a per-cluster file
+# because multicluster.name and apiServerExternalAddress differ per cluster;
+# the multicluster.peers block is identical on every cluster.
+#
+# Replace the <PLACEHOLDER> values before installing:
+#   - <RP_EAST_API_SERVER>:  EKS endpoint URL
+#       aws eks describe-cluster --region us-east-1 --name rp-east --query cluster.endpoint --output text
+#   - <RP_EAST_NLB_HOSTNAME>: hostname of the rp-east-multicluster-peer LoadBalancer Service
+#       kubectl --context rp-east -n redpanda get svc rp-east-multicluster-peer \
+#         -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+#   - <RP_WEST_NLB_HOSTNAME>: same lookup against the rp-west cluster
+#   - <RP_EU_NLB_HOSTNAME>:   same lookup against the rp-eu cluster
+
+fullnameOverride: rp-east
+
+enterprise:
+  licenseSecretRef:
+    name: redpanda-license
+    key: license.key
+
+crds:
+  enabled: true
+
+multicluster:
+  enabled: true
+  name: rp-east
+  apiServerExternalAddress: <RP_EAST_API_SERVER>
+  peers:
+    - name: rp-east
+      address: <RP_EAST_NLB_HOSTNAME>
+    - name: rp-west
+      address: <RP_WEST_NLB_HOSTNAME>
+    - name: rp-eu
+      address: <RP_EU_NLB_HOSTNAME>
+  service:
+    enabled: false

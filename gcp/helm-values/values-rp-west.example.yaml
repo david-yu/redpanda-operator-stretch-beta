@@ -1,0 +1,25 @@
+# See values-rp-east.example.yaml for placeholder lookup commands.
+
+fullnameOverride: rp-west
+
+enterprise:
+  licenseSecretRef:
+    name: redpanda-license
+    key: license.key
+
+crds:
+  enabled: true
+
+multicluster:
+  enabled: true
+  name: rp-west
+  apiServerExternalAddress: <RP_WEST_API_SERVER>
+  peers:
+    - name: rp-east
+      address: <RP_EAST_NLB_HOSTNAME>
+    - name: rp-west
+      address: <RP_WEST_NLB_HOSTNAME>
+    - name: rp-eu
+      address: <RP_EU_NLB_HOSTNAME>
+  service:
+    enabled: false

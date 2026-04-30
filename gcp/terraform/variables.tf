@@ -65,7 +65,7 @@ variable "clusters" {
       services_cidr = "10.121.0.0/20"
     }
     eu = {
-      region        = "europe-west1"
+      region        = "us-east4"
       name          = "rp-eu"
       subnet_cidr   = "10.30.0.0/20"
       pods_cidr     = "10.130.0.0/16"

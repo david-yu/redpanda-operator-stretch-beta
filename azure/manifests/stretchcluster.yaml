@@ -1,0 +1,50 @@
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: StretchCluster
+metadata:
+  name: redpanda
+  namespace: redpanda
+spec:
+  rbac:
+    enabled: true
+  external:
+    enabled: false
+  networking:
+    crossClusterMode: flat
+  # Rack awareness: each broker reads the K8s node's `topology.kubernetes.io/region`
+  # label and uses it as its rack. With the three-region EKS layout that gives
+  # racks of "us-east-1", "us-west-2", "eu-west-1" — the natural failure domain
+  # for a stretch cluster.
+  rackAwareness:
+    enabled: true
+    nodeAnnotation: topology.kubernetes.io/region
+  tls:
+    enabled: true
+    certs:
+      default:
+        caEnabled: true
+  enterprise:
+    licenseSecretRef:
+      name: redpanda-license
+      key: license.key
+  # Cluster-level Redpanda config. spec.config.cluster is an open map
+  # (x-kubernetes-preserve-unknown-fields) that flows directly into the
+  # broker's bootstrap.yaml.
+  #
+  # The values below are tuned for demo / validation:
+  #   - leader pinning prefers us-east-1, falls back to us-west-2, then eu-west-1
+  #   - autobalancer evicts a permanently-gone broker after ~60s
+  # For production, raise the autobalancer timeouts substantially (Redpanda's
+  # defaults are 900s / 600s) so a transient outage doesn't trigger a decommission.
+  config:
+    cluster:
+      # Ordered leader pinning. The leader balancer places partition leaders in
+      # the FIRST listed rack with available brokers; if every broker in that
+      # rack is unreachable, it falls through to the next rack, and so on.
+      default_leaders_preference: "racks:eastus,westus2,westeurope"
+      # Time a broker can be unreachable before it's marked unavailable for
+      # partition movement. Demo value (default: 900). Raise for production.
+      partition_autobalancing_node_availability_timeout_sec: 30
+      # Time a broker can stay unavailable before the autobalancer issues a
+      # decommission for it. Must be > the availability timeout above. Demo
+      # value (default: 600). Raise for production.
+      partition_autobalancing_node_autodecommission_timeout_sec: 60

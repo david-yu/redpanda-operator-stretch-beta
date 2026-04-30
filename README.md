@@ -2,7 +2,7 @@
 
 A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Validated end-to-end on AWS EKS (Transit Gateway across `us-east-1`/`us-west-2`/`eu-west-1`); GCP and Azure Terraform configs follow the same pattern but have not yet been run end-to-end in this repo.
 
-This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference; this repo's `terraform/`, `manifests/`, and `helm-values/` reflect the configs that actually work — see [Troubleshooting](#troubleshooting) for the why behind each one.
+This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The [original beta gist](https://gist.github.com/david-yu/41ea76df0cb4c84aad6483b1e95fcc32) is the conceptual reference; this repo's `aws/`, `gcp/`, and `azure/` directories each bundle the terraform, manifests, and helm-values that actually work for that cloud — see [Troubleshooting](#troubleshooting) for the why behind each one.
 
 ## Table of contents
 
@@ -30,37 +30,49 @@ This repo captures the exact configs that brought a stretch cluster up green on 
 ## Repo layout
 
 ```
-terraform/aws/    — VPCs, EKS, Transit Gateway peering, AWS LB Controller, peer LB Services
-terraform/gcp/    — Single global VPC + 3 regional subnets, GKE, firewall rules, peer LB Services
-terraform/azure/  — VNets, AKS, full-mesh VNet peering, NSGs, peer LB Services
-manifests/stretchcluster.yaml             — cloud-agnostic
-manifests/nodepool-*.yaml                 — cloud-agnostic
-helm-values/values-*.example.yaml         — cloud-agnostic; fill in placeholders before use
+aws/
+  terraform/    — VPCs, EKS, Transit Gateway peering, AWS LB Controller, peer LB Services
+  manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for AWS regions)
+  helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
+gcp/
+  terraform/    — Single global VPC + 3 regional subnets, GKE, firewall rules, peer LB Services
+  manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for GCP regions)
+  helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
+azure/
+  terraform/    — VNets, AKS, full-mesh VNet peering, NSGs, peer LB Services
+  manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for Azure regions)
+  helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
 ```
 
-The `terraform/<cloud>/` directories are independent — pick one cloud and `terraform apply` against it. The remaining steps (manifests, helm values, bootstrap) are cloud-agnostic.
+Each top-level cloud directory is self-contained — pick one cloud and run the full flow (terraform → bootstrap → helm install → manifests) from inside it. The nodepool manifests are cloud-agnostic; the only cloud-specific manifest difference is the `default_leaders_preference` rack list in `stretchcluster.yaml`, which uses the GKE/EKS/AKS-specific `topology.kubernetes.io/region` label values for that cloud.
 
 ## Architecture
 
-```
-                 region 1 (rp-east)          region 2 (rp-west)         region 3 (rp-eu)
-                ┌─────────────────────┐    ┌─────────────────────┐    ┌──────────────────────┐
-operator pod    │ rp-east             │◀──▶│ rp-west             │◀──▶│ rp-eu (raft leader)  │
-  raft :9443    │  └─ internal LB     │    │  └─ internal LB     │    │  └─ internal LB      │
-broker pod      │ redpanda-rp-east-0  │    │ redpanda-rp-west-0  │    │ redpanda-rp-eu-0     │
-  rpc    :33145 │     headless svc    │    │     headless svc    │    │     headless svc     │
-  kafka  :9093  │     pod IP routable │    │     pod IP routable │    │     pod IP routable  │
-                └─────────────────────┘    └─────────────────────┘    └──────────────────────┘
-                              ▲                         ▲                          ▲
-                              └───── cross-region L3 connectivity (full mesh) ─────┘
-                                          AWS Transit Gateway
-                                       │  GCP global VPC (no peering needed)
-                                       │  Azure VNet peering full mesh
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="Redpanda StretchCluster 3-region topology — operator raft (LB-mediated) plus broker mesh (direct pod IP) over cloud L3 connectivity" width="100%">
+</p>
+
+> **Reading the diagram.** Solid arrows are the **operator-to-operator raft** path (port 9443, mTLS, terminated at each region's internal LoadBalancer). Dashed arrows are **direct broker-to-broker** traffic — RPC :33145 and Kafka :9093 — which uses pod IPs (no LB hop) routed over the cloud's L3 mesh shown in the band below the regions. Both transports are full mesh among all three clusters.
 
 Two transports:
 - **Operator-to-operator (raft, port 9443)** — internal cloud LB per cluster, addresses baked into TLS SANs by `rpk k8s multicluster bootstrap --loadbalancer`.
 - **Broker-to-broker (RPC 33145, Kafka 9093)** — direct pod-IP routing. `networking.crossClusterMode: flat` makes the operator render headless Services and EndpointSlices populated with peer pod IPs. Routability comes from the cloud's L3 connectivity.
+
+### Broker layout: 2 / 2 / 1 with RF=5
+
+Each NodePool sets a per-region broker count: `nodepool-rp-east.yaml` and `nodepool-rp-west.yaml` use `replicas: 2`, `nodepool-rp-eu.yaml` uses `replicas: 1` — five brokers total, deployed `2 / 2 / 1` across the three regions. The default replication factor for new topics is `5` (one replica per broker), and the controller raft also includes all five brokers, so both data and control-plane raft groups need a 3-of-5 majority to make progress.
+
+The asymmetric `2 / 2 / 1` shape — instead of `2 / 2 / 2` or `1 / 1 / 1` — is the cheapest layout that survives **any single full-region outage** without losing quorum:
+
+| Region lost | Brokers remaining | Quorum (need 3) |
+|---|---|---|
+| rp-east (2 gone) | `0 + 2 + 1` = **3** | ✓ exactly at threshold |
+| rp-west (2 gone) | `2 + 0 + 1` = **3** | ✓ exactly at threshold |
+| rp-eu (1 gone)   | `2 + 2 + 0` = **4** | ✓ comfortable margin |
+
+The 1-broker `rp-eu` region acts as the **odd-vote tiebreaker** between the two larger regions. Losing it is cheap (you still have four brokers in two regions); losing either two-broker region drops to exactly the quorum minimum, so it's tolerated but tight — replication should already be caught up before a second failure can stack on top. A `1 / 1 / 1` cluster (RF=3) survives a single-region loss too, but with no spare capacity for a concurrent broker failure within a surviving region; `2 / 2 / 1` keeps a one-broker buffer in each large region.
+
+`default_leaders_preference: "racks:<region1>,<region2>,<region3>"` on top of this layout further makes leadership land in the first listed region whenever possible, so steady-state read/write traffic stays inside one region's brokers (lowest latency); leaders only fall through to the second/third region during an outage, which is what [Demo A](#demo-a-ordered-leader-pinning--region-failover-fallback) exercises.
 
 ## Prerequisites
 
@@ -85,12 +97,12 @@ Pick your cloud and follow the corresponding Terraform README — each handles V
 
 | Cloud | Terraform | Networking model |
 |---|---|---|
-| **AWS / EKS** | [`terraform/aws/`](terraform/aws/README.md) | Transit Gateway with full-mesh inter-region peering |
-| **GCP / GKE** | [`terraform/gcp/`](terraform/gcp/README.md) | Single global VPC with 3 regional subnets (no peering needed — GCP VPCs are global) |
-| **Azure / AKS** | [`terraform/azure/`](terraform/azure/README.md) | 3 regional VNets with full-mesh VNet peering |
+| **AWS / EKS** | [`aws/terraform/`](aws/terraform/README.md) | Transit Gateway with full-mesh inter-region peering |
+| **GCP / GKE** | [`gcp/terraform/`](gcp/terraform/README.md) | Single global VPC with 3 regional subnets (no peering needed — GCP VPCs are global) |
+| **Azure / AKS** | [`azure/terraform/`](azure/terraform/README.md) | 3 regional VNets with full-mesh VNet peering |
 
 ```bash
-cd terraform/<aws|gcp|azure>
+cd <aws|gcp|azure>/terraform
 terraform init
 terraform apply         # AWS / Azure
 # or:
@@ -147,7 +159,7 @@ Render per-cluster helm values from the example templates and substitute the pee
 
 ```bash
 for C in rp-east rp-west rp-eu; do
-  cp helm-values/values-${C}.example.yaml /tmp/values-${C}.yaml
+  cp <cloud>/helm-values/values-${C}.example.yaml /tmp/values-${C}.yaml
 done
 
 # Substitute the API server endpoint per cluster.
@@ -222,16 +234,16 @@ Apply the StretchCluster (identical on every cluster):
 
 ```bash
 for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" -n redpanda apply -f manifests/stretchcluster.yaml
+  kubectl --context "$C" -n redpanda apply -f <cloud>/<cloud>/manifests/stretchcluster.yaml
 done
 ```
 
 Apply each NodePool to its own cluster:
 
 ```bash
-kubectl --context rp-east -n redpanda apply -f manifests/nodepool-rp-east.yaml
-kubectl --context rp-west -n redpanda apply -f manifests/nodepool-rp-west.yaml
-kubectl --context rp-eu   -n redpanda apply -f manifests/nodepool-rp-eu.yaml
+kubectl --context rp-east -n redpanda apply -f <cloud>/manifests/nodepool-rp-east.yaml
+kubectl --context rp-west -n redpanda apply -f <cloud>/manifests/nodepool-rp-west.yaml
+kubectl --context rp-eu   -n redpanda apply -f <cloud>/manifests/nodepool-rp-eu.yaml
 ```
 
 The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). Both differ from the gist; see [Troubleshooting](#troubleshooting) issues 7–8.
@@ -313,7 +325,7 @@ If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection re
 
 ## Optional demos
 
-The default `stretchcluster.yaml` enables two stretch-cluster-specific features that aren't on by default in the gist's spec: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `manifests/stretchcluster.yaml` and applied at deploy time.
+The default `stretchcluster.yaml` enables two stretch-cluster-specific features that aren't on by default in the gist's spec: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
 
 The committed defaults are:
 
@@ -471,7 +483,7 @@ A few caveats observed during validation:
 
 ### Demo B: ghost broker auto-decommission
 
-When a broker is permanently gone for longer than `partition_autobalancing_node_autodecommission_timeout_sec`, the partition autobalancer should automatically issue a decommission for it — the broker leaves the cluster, replicas redistribute, and the membership shrinks. The relevant timeouts (`partition_autobalancing_node_availability_timeout_sec: 30`, `partition_autobalancing_node_autodecommission_timeout_sec: 60`) are already in `manifests/stretchcluster.yaml`, so the demo runs as-is.
+When a broker is permanently gone for longer than `partition_autobalancing_node_autodecommission_timeout_sec`, the partition autobalancer should automatically issue a decommission for it — the broker leaves the cluster, replicas redistribute, and the membership shrinks. The relevant timeouts (`partition_autobalancing_node_availability_timeout_sec: 30`, `partition_autobalancing_node_autodecommission_timeout_sec: 60`) are already in `<cloud>/manifests/stretchcluster.yaml`, so the demo runs as-is.
 
 **Permanently kill one broker** (delete its pod AND its PVC so it can't come back with the same identity):
 
@@ -546,7 +558,7 @@ PARTITION  LEADER  EPOCH  REPLICAS   LOG-START-OFFSET  HIGH-WATERMARK
 **Important caveats observed during validation** that may differ from documentation:
 
 - **Auto-decom requires the autobalancer to have a healthy view of the cluster.** The autobalancer's `status` field (visible at `https://<broker>:9644/v1/cluster/partition_balancer/status`) shows `stalled` when too many brokers appear unavailable. Cross-region heartbeat flapping during a regional outage can stall it indefinitely. If you see `"status": "stalled"` and the broker isn't being decommissioned, fall back to a manual decommission: `rpk redpanda admin brokers decommission <id> --skip-liveness-check`.
-- **The operator reverts cluster config from the StretchCluster spec on every reconcile.** Any `rpk cluster config set` against keys that are also in `spec.config.cluster` will be undone on the next reconcile pass. If you want a different timeout for a one-off demo, edit `manifests/stretchcluster.yaml` and re-apply rather than setting it via rpk.
+- **The operator reverts cluster config from the StretchCluster spec on every reconcile.** Any `rpk cluster config set` against keys that are also in `spec.config.cluster` will be undone on the next reconcile pass. If you want a different timeout for a one-off demo, edit `<cloud>/manifests/stretchcluster.yaml` and re-apply rather than setting it via rpk.
 
 After either demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replicated partitions) and that the `multicluster.peers`/raft layer is still intact via `rpk k8s multicluster status`.
 
@@ -570,9 +582,28 @@ for C in rp-east rp-west rp-eu; do
 done
 
 # 3. Tear down infrastructure with Terraform.
-cd terraform/<aws|gcp|azure>
+cd <aws|gcp|azure>/terraform
 terraform destroy
 # (GCP: terraform destroy -var project_id=<your-gcp-project>)
+
+# 4. Remove the now-stale kubectl contexts/clusters/users from your local kubeconfig.
+#    Skip this and the next `terraform apply` will fail to register fresh
+#    contexts with "the context 'rp-east' already exists" (the rename step
+#    in `kubectl_setup_commands` errors when the alias is taken).
+#
+#    Note: `kubectl config rename-context` only renames the *context*; the
+#    underlying cluster + user records keep the cloud's full name (GCP
+#    `gke_<project>_<region>_rp-east`, AWS `arn:aws:eks:...:cluster/rp-east`,
+#    Azure `rp-east`). Match by name suffix to catch all three.
+for C in rp-east rp-west rp-eu; do
+  kubectl config delete-context "$C" 2>/dev/null || true
+done
+for NAME in $(kubectl config view -o jsonpath='{.clusters[*].name}' | tr ' ' '\n' | grep -E 'rp-(east|west|eu)$'); do
+  kubectl config delete-cluster "$NAME" 2>/dev/null || true
+done
+for NAME in $(kubectl config view -o jsonpath='{.users[*].name}' | tr ' ' '\n' | grep -E 'rp-(east|west|eu)$'); do
+  kubectl config delete-user "$NAME" 2>/dev/null || true
+done
 ```
 
 Cloud-specific notes:
@@ -662,12 +693,12 @@ The operator wants to convert per-pod Services to headless (clusterIP=None) for 
 
 ### 10. `rpk topic create` from inside a broker pod hangs / "i/o timeout" on port 9093
 
-Kafka client port `9093` (and Pandaproxy `8082`, Admin `9644`) are not open across cluster CIDRs in firewall/NSG rules by default. The original gist only mentions `33145`. The Terraform in this repo opens all five via the `cross_cluster_ports` variable on every cloud (see `terraform/aws/sg.tf`, `terraform/gcp/firewall.tf`, `terraform/azure/nsg.tf`).
+Kafka client port `9093` (and Pandaproxy `8082`, Admin `9644`) are not open across cluster CIDRs in firewall/NSG rules by default. The original gist only mentions `33145`. The Terraform in this repo opens all five via the `cross_cluster_ports` variable on every cloud (see `aws/terraform/sg.tf`, `gcp/terraform/firewall.tf`, `azure/terraform/nsg.tf`).
 
 ### 11. PVC `Pending`: "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims"
 
 Cluster has no default StorageClass. Cloud-specific defaults:
-- **AWS / EKS**: newer EKS doesn't ship `gp2` annotated default — `terraform/aws/eks.tf` patches `gp2` as default automatically.
+- **AWS / EKS**: newer EKS doesn't ship `gp2` annotated default — `aws/terraform/eks.tf` patches `gp2` as default automatically.
 - **GCP / GKE**: `standard-rwo` is default out of the box.
 - **Azure / AKS**: `default` (Azure Managed Disks) is default out of the box.
 

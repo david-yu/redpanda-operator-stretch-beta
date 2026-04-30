@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 800" width="1280" height="800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f2937"/>
+    </marker>
+    <marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6d28d9"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="800" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="640" y="36" text-anchor="middle" font-size="20" font-weight="700" fill="#0f172a">Redpanda StretchCluster · 3-region topology</text>
+  <text x="640" y="60" text-anchor="middle" font-size="13" fill="#64748b">operator raft (port 9443, mTLS, LB-mediated)  ·  broker mesh (ports 33145 / 9093, direct pod IP)  ·  over cloud L3 connectivity</text>
+
+  <!-- Region 1: rp-east -->
+  <g transform="translate(60,100)">
+    <rect width="360" height="500" rx="14" fill="#f8fafc" stroke="#475569" stroke-width="1.5"/>
+    <text x="180" y="32" text-anchor="middle" font-weight="700" font-size="15" fill="#0f172a">region 1 — rp-east</text>
+    <text x="180" y="51" text-anchor="middle" font-size="12" fill="#64748b">2 brokers  ·  rack: us-east1 / us-east-1 / eastus</text>
+
+    <!-- operator pod -->
+    <rect x="60" y="76" width="240" height="60" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="180" y="102" text-anchor="middle" font-weight="600" font-size="14" fill="#92400e">operator pod (rp-east)</text>
+    <text x="180" y="121" text-anchor="middle" font-size="12" fill="#92400e">raft listener :9443 (mTLS)</text>
+
+    <line x1="180" y1="136" x2="180" y2="168" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,2"/>
+
+    <!-- internal LB -->
+    <ellipse cx="180" cy="192" rx="125" ry="24" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="180" y="188" text-anchor="middle" font-weight="600" font-size="14" fill="#1e3a8a">internal LB</text>
+    <text x="180" y="204" text-anchor="middle" font-size="12" fill="#1e3a8a">port 9443 (mTLS)</text>
+
+    <!-- broker 0 -->
+    <rect x="40" y="240" width="280" height="64" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+    <text x="180" y="266" text-anchor="middle" font-weight="600" font-size="14" fill="#064e3b">redpanda-rp-east-0</text>
+    <text x="180" y="285" text-anchor="middle" font-size="12" fill="#064e3b">RPC :33145  ·  Kafka :9093</text>
+
+    <!-- broker 1 -->
+    <rect x="40" y="320" width="280" height="64" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+    <text x="180" y="346" text-anchor="middle" font-weight="600" font-size="14" fill="#064e3b">redpanda-rp-east-1</text>
+    <text x="180" y="365" text-anchor="middle" font-size="12" fill="#064e3b">RPC :33145  ·  Kafka :9093</text>
+
+    <!-- footnotes -->
+    <text x="180" y="420" text-anchor="middle" font-size="11" fill="#6b7280" font-style="italic">headless Service · peer pod IPs in EndpointSlices</text>
+    <text x="180" y="438" text-anchor="middle" font-size="11" fill="#6b7280" font-style="italic">networking.crossClusterMode: flat</text>
+    <text x="180" y="475" text-anchor="middle" font-size="12" font-weight="600" fill="#0f766e">leader-preference rank: 1 (primary)</text>
+  </g>
+
+  <!-- Region 2: rp-west -->
+  <g transform="translate(460,100)">
+    <rect width="360" height="500" rx="14" fill="#f8fafc" stroke="#475569" stroke-width="1.5"/>
+    <text x="180" y="32" text-anchor="middle" font-weight="700" font-size="15" fill="#0f172a">region 2 — rp-west</text>
+    <text x="180" y="51" text-anchor="middle" font-size="12" fill="#64748b">2 brokers  ·  rack: us-west1 / us-west-2 / westus2</text>
+
+    <rect x="60" y="76" width="240" height="60" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="180" y="102" text-anchor="middle" font-weight="600" font-size="14" fill="#92400e">operator pod (rp-west)</text>
+    <text x="180" y="121" text-anchor="middle" font-size="12" fill="#92400e">raft listener :9443 (mTLS)</text>
+
+    <line x1="180" y1="136" x2="180" y2="168" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,2"/>
+
+    <ellipse cx="180" cy="192" rx="125" ry="24" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="180" y="188" text-anchor="middle" font-weight="600" font-size="14" fill="#1e3a8a">internal LB</text>
+    <text x="180" y="204" text-anchor="middle" font-size="12" fill="#1e3a8a">port 9443 (mTLS)</text>
+
+    <rect x="40" y="240" width="280" height="64" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+    <text x="180" y="266" text-anchor="middle" font-weight="600" font-size="14" fill="#064e3b">redpanda-rp-west-0</text>
+    <text x="180" y="285" text-anchor="middle" font-size="12" fill="#064e3b">RPC :33145  ·  Kafka :9093</text>
+
+    <rect x="40" y="320" width="280" height="64" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+    <text x="180" y="346" text-anchor="middle" font-weight="600" font-size="14" fill="#064e3b">redpanda-rp-west-1</text>
+    <text x="180" y="365" text-anchor="middle" font-size="12" fill="#064e3b">RPC :33145  ·  Kafka :9093</text>
+
+    <text x="180" y="420" text-anchor="middle" font-size="11" fill="#6b7280" font-style="italic">headless Service · peer pod IPs in EndpointSlices</text>
+    <text x="180" y="438" text-anchor="middle" font-size="11" fill="#6b7280" font-style="italic">networking.crossClusterMode: flat</text>
+    <text x="180" y="475" text-anchor="middle" font-size="12" font-weight="600" fill="#0f766e">leader-preference rank: 2</text>
+  </g>
+
+  <!-- Region 3: rp-eu -->
+  <g transform="translate(860,100)">
+    <rect width="360" height="500" rx="14" fill="#f8fafc" stroke="#475569" stroke-width="1.5"/>
+    <text x="180" y="32" text-anchor="middle" font-weight="700" font-size="15" fill="#0f172a">region 3 — rp-eu</text>
+    <text x="180" y="51" text-anchor="middle" font-size="12" fill="#64748b">1 broker (tiebreaker)  ·  rack: us-east4 / eu-west-1 / westeurope</text>
+
+    <rect x="60" y="76" width="240" height="60" rx="8" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="180" y="102" text-anchor="middle" font-weight="600" font-size="14" fill="#92400e">operator pod (rp-eu)</text>
+    <text x="180" y="121" text-anchor="middle" font-size="12" fill="#92400e">raft listener :9443 (mTLS)</text>
+
+    <line x1="180" y1="136" x2="180" y2="168" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,2"/>
+
+    <ellipse cx="180" cy="192" rx="125" ry="24" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="180" y="188" text-anchor="middle" font-weight="600" font-size="14" fill="#1e3a8a">internal LB</text>
+    <text x="180" y="204" text-anchor="middle" font-size="12" fill="#1e3a8a">port 9443 (mTLS)</text>
+
+    <rect x="40" y="240" width="280" height="64" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
+    <text x="180" y="266" text-anchor="middle" font-weight="600" font-size="14" fill="#064e3b">redpanda-rp-eu-0</text>
+    <text x="180" y="285" text-anchor="middle" font-size="12" fill="#064e3b">RPC :33145  ·  Kafka :9093</text>
+
+    <text x="180" y="420" text-anchor="middle" font-size="11" fill="#6b7280" font-style="italic">headless Service · peer pod IPs in EndpointSlices</text>
+    <text x="180" y="438" text-anchor="middle" font-size="11" fill="#6b7280" font-style="italic">networking.crossClusterMode: flat</text>
+    <text x="180" y="475" text-anchor="middle" font-size="12" font-weight="600" fill="#0f766e">leader-preference rank: 3 (fallback)</text>
+  </g>
+
+  <!-- Operator raft adjacent arrows in gaps (LB ↔ LB) -->
+  <line x1="305" y1="292" x2="455" y2="292" stroke="#1f2937" stroke-width="2.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <line x1="705" y1="292" x2="855" y2="292" stroke="#1f2937" stroke-width="2.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text x="380" y="278" text-anchor="middle" font-size="11" fill="#0f172a" font-weight="600">operator raft :9443</text>
+  <text x="780" y="278" text-anchor="middle" font-size="11" fill="#0f172a" font-weight="600">operator raft :9443</text>
+
+  <!-- Broker mesh adjacent arrows in gaps (top broker ↔ top broker) -->
+  <line x1="320" y1="372" x2="500" y2="372" stroke="#6d28d9" stroke-width="2.5" stroke-dasharray="6,3" marker-start="url(#arrow-violet)" marker-end="url(#arrow-violet)"/>
+  <line x1="720" y1="372" x2="900" y2="372" stroke="#6d28d9" stroke-width="2.5" stroke-dasharray="6,3" marker-start="url(#arrow-violet)" marker-end="url(#arrow-violet)"/>
+  <text x="410" y="360" text-anchor="middle" font-size="11" fill="#5b21b6" font-weight="600">broker RPC :33145 / Kafka :9093</text>
+  <text x="810" y="360" text-anchor="middle" font-size="11" fill="#5b21b6" font-weight="600">broker RPC :33145 / Kafka :9093</text>
+
+  <!-- Full-mesh note (raft + broker are both full mesh — east ↔ eu link is implied) -->
+  <text x="640" y="630" text-anchor="middle" font-size="12" fill="#475569" font-style="italic">both transports are full mesh — every cluster also talks directly to the non-adjacent peer (rp-east ↔ rp-eu)</text>
+
+  <!-- L3 mesh banner -->
+  <rect x="40" y="650" width="1200" height="80" rx="12" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5"/>
+  <text x="640" y="678" text-anchor="middle" font-weight="700" font-size="14" fill="#4c1d95">cross-region L3 mesh — provides routability for the broker mesh above</text>
+  <text x="640" y="703" text-anchor="middle" font-size="12" fill="#4c1d95">AWS Transit Gateway (full-mesh peering)    ·    GCP global VPC (built-in, no peering needed)    ·    Azure VNet peering (full mesh)</text>
+
+  <!-- Legend -->
+  <g transform="translate(40,756)">
+    <line x1="0" y1="6" x2="40" y2="6" stroke="#1f2937" stroke-width="2.5"/>
+    <text x="48" y="10" font-size="11" fill="#475569">solid = operator raft (LB-mediated, mTLS, port 9443)</text>
+    <line x1="380" y1="6" x2="420" y2="6" stroke="#6d28d9" stroke-width="2.5" stroke-dasharray="6,3"/>
+    <text x="428" y="10" font-size="11" fill="#475569">dashed = broker mesh (direct pod IP, ports 33145 / 9093)</text>
+    <line x1="780" y1="6" x2="800" y2="6" stroke="#475569" stroke-width="1.5" stroke-dasharray="3,2"/>
+    <text x="808" y="10" font-size="11" fill="#475569">dotted = in-region pod-to-LB hop</text>
+  </g>
+</svg>
