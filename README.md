@@ -1102,7 +1102,7 @@ Egress pricing for cross-region replication / consumer-fetch traffic at default 
 - Consumer fetches against a leader in another region pay the cross-region rate again
 
 So a 10 Mbps producer (≈ 1.25 MB/s = 108 GB/day) with the leader in `us-east-1` and replicas in `us-west-2` + `eu-west-1` generates:
-- AWS: ~108 GB × 2 cross-region copies × $0.04/GB = **~$8.60/day** in cross-region traffic alone
+- AWS: 108 GB × 2 cross-region copies × $0.04/GB = **~$8.60/day** in cross-region traffic alone
 - GCP (us-east1 → us-west1 + us-east4): 108 GB × 2 × $0.02/GB = **~$4.30/day**
 - Azure (eastus → westus2 + centralus): 108 GB × 2 × $0.04/GB = **~$8.60/day**
 
