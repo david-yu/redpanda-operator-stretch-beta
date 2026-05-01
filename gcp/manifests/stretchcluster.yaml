@@ -40,7 +40,10 @@ spec:
       # Ordered leader pinning. The leader balancer places partition leaders in
       # the FIRST listed rack with available brokers; if every broker in that
       # rack is unreachable, it falls through to the next rack, and so on.
-      default_leaders_preference: "racks:us-east1,us-west1,us-east4"
+      # The failover region (us-central1 by default in gcp/terraform-failover) is
+      # listed second so that if the primary rack (us-east1) is unavailable, the
+      # controller migrates to a low-RTT fallback rack first.
+      default_leaders_preference: "racks:us-east1,us-central1,us-west1,us-east4"
       # Time a broker can be unreachable before it's marked unavailable for
       # partition movement. Demo value (default: 900). Raise for production.
       partition_autobalancing_node_availability_timeout_sec: 30
