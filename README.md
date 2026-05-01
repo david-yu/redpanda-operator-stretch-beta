@@ -1,6 +1,14 @@
 # Redpanda Operator v26.2.1-beta.1 — Stretch Cluster on AWS, GCP, or Azure
 
-A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Validated end-to-end most recently on **GCP / GKE** (`us-east1` / `us-west1` / `us-east4`, with `us-central1` as the failover region) — both Demo A (leader pinning) and Demo B (failover capacity injection) run cleanly. Validated on **AWS / EKS** (Transit Gateway across `us-east-1` / `us-west-2` / `eu-west-1`) for the bring-up and Demo A; Demo B exposes two AWS-specific gotchas worth knowing about (cross-Atlantic RTT exceeds Redpanda's hardcoded 100 ms heartbeat timeout, and the operator startup requires every peer reachable) — both [documented inline](#demo-b-regional-failure--temporary-failover-region-capacity-injection). **Azure / AKS** has working terraform but no end-to-end validation in this repo yet.
+A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Most recently validated on **all three clouds** with [`ordered_racks` leader pinning](https://docs.redpanda.com/current/develop/produce-data/leader-pinning/#failover-with-ordered-rack-preference) and a continuous **10 Mbps OMB-style producer + consumer** running through Demo A (leader pinning) and Demo B (failover capacity injection):
+
+| Cloud | Region triple (+ failover) | Demo A | Demo B | Producer survived? | AWS-style cross-region heartbeat issue? |
+|---|---|---|---|---|---|
+| **GCP / GKE** | `us-east1` / `us-west1` / `us-east4` (+ `us-central1`) | ✓ leaders 6/6 → fall through → return | ✓ stalled → unstuck after capacity → 5 brokers healthy | ✓ 1280 msg/s steady (24 ms baseline → 100-220 ms during failure → 38 ms post) | No (all RTTs < 100 ms) |
+| **Azure / AKS** | `eastus` / `westus2` / `centralus` (+ `eastus2`) | ✓ leaders 6/6 → fall through → return | ✓ stalled → unstuck after capacity → 5 brokers healthy | ✓ 1280 msg/s steady (50 ms baseline → 150 ms during failure → 47 ms post) | No (all RTTs < 100 ms) |
+| **AWS / EKS** | `us-east-1` / `us-west-2` / `eu-west-1` (+ `us-east-2`) | ✓ leaders 6/6 → fall through → return | ✓ stalled → unstuck after capacity + manual controller-leadership transfer to `us-east-2` → 5 brokers healthy | ✓ 1280 msg/s steady (84 ms baseline → 270 ms during failure → 87 ms post) | **Yes** — `eu-west-1 ↔ us-west-2` is ~140 ms; transfer the controller raft leader to a us-east-2 broker after Demo B step 1. See the [AWS-only callout](#demo-b-regional-failure--temporary-failover-region-capacity-injection). |
+
+The continuous-load harness lives at [`omb/`](omb/) and runs as a pair of K8s Jobs in the `redpanda` namespace (single-pod kafka-producer-perf-test + kafka-consumer-perf-test, mTLS to the operator-issued CA). It produces ~1.25 MB/s = 10 Mbps for as long as the demo runs and prints throughput / latency every 5 s, so a regional outage shows up immediately as latency climbing — not as silent data loss.
 
 This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The `aws/`, `gcp/`, and `azure/` directories each bundle the terraform, manifests, and helm-values that actually work for that cloud — see [Troubleshooting](#troubleshooting) for the why behind each one.
 
@@ -41,6 +49,10 @@ azure/
   terraform/    — VNets, AKS, full-mesh VNet peering, NSGs, peer LB Services
   manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for Azure regions)
   helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
+omb/             — cloud-agnostic 10 Mbps continuous-load Jobs that run alongside Demo A / B
+                  (kafka-producer-perf-test + kafka-consumer-perf-test in the redpanda namespace,
+                  plus run-demo.sh that wraps the cordon/uncordon dance with snapshots of broker
+                  health + producer throughput) — see omb/README.md
 ```
 
 Each top-level cloud directory is self-contained — pick one cloud and run the full flow (terraform → bootstrap → helm install → manifests) from inside it. The nodepool manifests are cloud-agnostic; the only cloud-specific manifest difference is the `default_leaders_preference` rack list in `stretchcluster.yaml`, which uses the GKE/EKS/AKS-specific `topology.kubernetes.io/region` label values for that cloud.
@@ -1031,7 +1043,45 @@ kubectl --context <c> -n redpanda delete pod redpanda-<pool>-0 --grace-period=0 
 
 ## Cost (running)
 
-- **AWS**: 3× EKS control plane + 9× m5.xlarge + 3× internal NLB + TGW (3 attachments + 3 inter-region peerings) ≈ **$2.10/hr** at on-demand pricing, plus inter-region data transfer.
-- **GCP**: 3× regional GKE control plane @ $0.10/hr ($0.30/hr) + 9× n2-standard-4 @ $0.1942/hr ($1.75/hr — `node_count=1` per cluster but regional clusters distribute that to all 3 zones, so 3 VMs per cluster × 3 clusters; raise only if you actually need more headroom than the 2 broker pods + operator + cert-manager use) + 9× 50 GB pd-balanced boot disks @ $0.0067/hr ($0.06/hr) + 3× internal Passthrough Network LB forwarding rules @ $0.025/hr ($0.075/hr) + 3× Cloud NAT gateway @ $0.045/hr ($0.135/hr) + Cloud Router (free) ≈ **$2.32/hr** at on-demand pricing, plus inter-region egress (charged per GB).
-- **Azure**: 3× AKS control plane (Free tier, no charge) + 6× Standard_D4s_v5 @ $0.192/hr ($1.15/hr — `node_count=2` per cluster × 3 clusters; bump only if your subscription's regional vCPU quota for the DSv5 family allows it, default sandbox is 10/region) + 6× ~64 GB Premium SSD OS disks @ $0.00525/hr ($0.03/hr) + 3× Standard Public IP for AKS outbound NAT @ $0.005/hr ($0.015/hr) + 6× internal Standard LB forwarding rules (1 outbound + 1 peer-Service per cluster — first 5 rules per LB free at idle) ≈ **$1.20/hr** at on-demand pricing, plus inter-region VNet peering egress (charged per GB).
-  - Demo B (failover region temporarily up): adds 1× AKS control plane (Free) + 2× Standard_D4s_v5 ($0.38/hr) + 2× OS disks ($0.01/hr) + 1× Public IP ($0.005/hr) ≈ **+$0.40/hr** while the failover stack is running.
+Two cost dimensions matter for a stretch cluster: **fixed hourly infrastructure** (the K8s clusters, VMs, mesh networking primitives) and **variable cross-region data transfer** (RF replication and consumer fetches across regions). The cross-region per-GB pricing is what dominates the bill at any meaningful throughput — see the second table below.
+
+### Fixed hourly infrastructure — 3-region main stack
+
+| Component | AWS | GCP | Azure |
+|---|---|---|---|
+| Managed K8s control plane | 3× EKS @ $0.10/hr = **$0.30/hr** | 3× regional GKE @ $0.10/hr = **$0.30/hr** | 3× AKS Free tier = **$0.00/hr** |
+| Worker nodes (per cluster) | 3× m5.xlarge ($0.192/hr × 3 = $0.58/hr) | 3× n2-standard-4 ($0.1942/hr × 3 = $0.58/hr) | 2× Standard_D4s_v5 ($0.192/hr × 2 = $0.38/hr) |
+| Worker nodes (3 clusters) | **$1.73/hr** | **$1.75/hr** | **$1.15/hr** |
+| Boot disks | included in EKS pricing | 9× 50 GiB pd-balanced @ $0.0067/hr = **$0.06/hr** | 6× ~64 GiB Premium SSD @ $0.00525/hr = **$0.03/hr** |
+| Outbound NAT | NAT GW: 3× $0.045/hr = **$0.14/hr** | Cloud NAT: 3× $0.045/hr = **$0.14/hr** | Public IP for outbound: 3× $0.005/hr = **$0.02/hr** |
+| Peer LB (raft, internal) | 3× NLB ≈ **$0.05/hr** | 3× internal LB forwarding rule @ $0.025/hr = **$0.08/hr** | included in Standard LB (first 5 rules free) |
+| Mesh / inter-region networking | TGW: 3 attachments + 3 peerings = 6× $0.05/hr = **$0.30/hr** | Single global VPC = **$0.00/hr** (no peering) | VNet peering: peering link **$0.00/hr** (per-GB only) |
+| **Total fixed (3-region main stack)** | **≈ $2.50/hr** | **≈ $2.40/hr** | **≈ $1.20/hr** |
+| Demo B add: failover region | adds 1× EKS + 3× m5.xlarge + 1× NLB + 3 TGW peerings + new attachment ≈ **+$1.05/hr** | adds 1× regional GKE + 3× n2-standard-4 + 1× LB + 1× NAT GW ≈ **+$0.85/hr** | adds 1× AKS (Free) + 2× D4s_v5 + 1× Public IP ≈ **+$0.40/hr** |
+
+> Azure's headline is "AKS control plane is free" + smaller Standard_D4s_v5 default + Standard LB rules-included pricing. AWS pays a $0.30/hr surcharge for the TGW attachments alone (full mesh). GCP's global-VPC simplification means no peering fees but per-instance and per-LB rules cost more.
+
+### Cross-region data transfer (variable, per GB) — the cost that scales with throughput
+
+Egress pricing for cross-region replication / consumer-fetch traffic at default on-demand rates. **AWS and Azure charge in both directions** when going through TGW / VNet peering; GCP is the simplest model (one-side egress only).
+
+| Hop type | AWS | GCP | Azure |
+|---|---|---|---|
+| Within continent (e.g. `us-east-1` → `us-west-2`) | $0.02/GB egress + TGW data-processing $0.02/GB ≈ **$0.04/GB** | $0.02/GB egress (one-side) | $0.02/GB egress + $0.02/GB ingress (peering) = **$0.04/GB** |
+| Cross-continent (e.g. `us-east-1` → `eu-west-1`) | $0.02/GB egress + TGW $0.02/GB ≈ **$0.04/GB** | $0.05/GB egress (US → Europe) | $0.05/GB egress + $0.05/GB ingress = **$0.10/GB** |
+| Within continent example (this repo) | `us-east-1` ↔ `us-west-2`: $0.04/GB | `us-east1` ↔ `us-west1`: $0.02/GB | `eastus` ↔ `westus2`: $0.04/GB |
+| Cross-continent example (this repo) | `us-east-1` ↔ `eu-west-1`: $0.04/GB | (GCP triple in repo is all-US, so no x-continent leg) | `eastus` ↔ `centralus`: $0.04/GB (intra-US) |
+
+**Redpanda multiplier.** For a stretch cluster with `RF=5` across 3 regions in a 2/2/1 layout, every produced byte fans out across the cluster like this:
+- 1 in-region replica (free within the same region/AZ in most clouds)
+- 1-2 *cross-region* replicas at the source's per-GB egress rate
+- Consumer fetches against a leader in another region pay the cross-region rate again
+
+So a 10 Mbps producer (≈ 1.25 MB/s = 108 GB/day) with the leader in `us-east-1` and replicas in `us-west-2` + `eu-west-1` generates:
+- AWS: ~108 GB × 2 cross-region copies × $0.04/GB = **~$8.60/day** in cross-region traffic alone
+- GCP (us-east1 → us-west1 + us-east4): 108 GB × 2 × $0.02/GB = **~$4.30/day**
+- Azure (eastus → westus2 + centralus): 108 GB × 2 × $0.04/GB = **~$8.60/day**
+
+For a 100 Mbps production cluster, multiply by 10 (and add the consumer-fetch leg if your consumers don't co-locate with leaders). **Cross-region transfer eclipses the fixed hourly cost above 10-50 Mbps of sustained throughput**, which is why pinning leaders into one region with `default_leaders_preference: ordered_racks:…` and consuming locally makes a material economic difference.
+
+> Pricing snapshot from late 2025; verify against your current rate card before quoting numbers. AWS in particular has shifted inter-region pricing several times — confirm via the [VPC pricing](https://aws.amazon.com/vpc/pricing/) page and [TGW pricing](https://aws.amazon.com/transit-gateway/pricing/) page. GCP's [Network Service Tiers](https://cloud.google.com/network-tiers/pricing) page covers Premium tier defaults. Azure's [bandwidth pricing](https://azure.microsoft.com/pricing/details/bandwidth/) covers VNet peering specifically.
