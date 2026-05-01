@@ -126,16 +126,27 @@ azure_sweep() {
   done
 }
 
+# Remove rp-* contexts/clusters/users from kubeconfig — but only those
+# resolving to AKS clusters in this account. Matching only on the alias
+# would also blow away the user's AWS/GCP contexts when they happen to
+# share the same alias (the script in this repo's other clouds does the
+# same check).
 clean_kubectl() {
   local pattern=$1
-  for c in $(kubectl config view -o jsonpath='{.contexts[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-context "$c" 2>/dev/null || true
-  done
-  for n in $(kubectl config view -o jsonpath='{.clusters[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-cluster "$n" 2>/dev/null || true
-  done
-  for n in $(kubectl config view -o jsonpath='{.users[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-user "$n" 2>/dev/null || true
+  for ctx in $(kubectl config view -o jsonpath='{.contexts[*].name}' 2>/dev/null \
+                 | tr ' ' '\n' | grep -E "$pattern"); do
+    local cluster user
+    cluster=$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}" 2>/dev/null)
+    user=$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.user}" 2>/dev/null)
+    # AKS users are named clusterUser_<rg>_<cluster>; AKS cluster entries are
+    # just the cluster name. Use the user prefix as the unambiguous AKS marker.
+    if [[ "$user" == clusterUser_* ]]; then
+      kubectl config delete-context "$ctx" 2>/dev/null     && log "  deleted context $ctx"   || true
+      kubectl config delete-cluster "$cluster" 2>/dev/null && log "  deleted cluster $cluster" || true
+      kubectl config delete-user    "$user" 2>/dev/null    && log "  deleted user    $user"    || true
+    else
+      log "  skipping $ctx (user=$user — not AKS)"
+    fi
   done
 }
 

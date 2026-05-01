@@ -164,19 +164,24 @@ aws_sweep() {
   done
 }
 
-# Remove rp-* contexts/clusters/users from kubeconfig. The cluster + user
-# entries are usually keyed by the cloud's full name (e.g. EKS cluster ARNs),
-# so delete by name pattern, not just the rename alias.
+# Remove rp-* contexts/clusters/users from kubeconfig — but only the
+# AWS-backed ones. We resolve each rp-* context's underlying cluster and
+# only act on it if the cluster name is the EKS ARN form (`arn:aws:eks:…`).
+# This keeps GCP/Azure contexts with the same alias names (e.g. when the
+# user has been validating multiple clouds back-to-back) intact.
 clean_kubectl() {
   local pattern=$1
-  for c in $(kubectl config view -o jsonpath='{.contexts[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-context "$c" 2>/dev/null || true
-  done
-  for n in $(kubectl config view -o jsonpath='{.clusters[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-cluster "$n" 2>/dev/null || true
-  done
-  for n in $(kubectl config view -o jsonpath='{.users[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-user "$n" 2>/dev/null || true
+  for ctx in $(kubectl config view -o jsonpath='{.contexts[*].name}' 2>/dev/null \
+                 | tr ' ' '\n' | grep -E "$pattern"); do
+    local cluster
+    cluster=$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}" 2>/dev/null)
+    if [[ "$cluster" == arn:aws:eks:* ]]; then
+      kubectl config delete-context "$ctx" 2>/dev/null && log "  deleted context $ctx"   || true
+      kubectl config delete-cluster "$cluster" 2>/dev/null && log "  deleted cluster $cluster" || true
+      kubectl config delete-user    "$cluster" 2>/dev/null && log "  deleted user    $cluster" || true
+    else
+      log "  skipping $ctx (cluster=$cluster — not AWS EKS)"
+    fi
   done
 }
 

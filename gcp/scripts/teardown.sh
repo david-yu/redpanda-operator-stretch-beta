@@ -95,16 +95,24 @@ tf_destroy() {
   popd >/dev/null
 }
 
+# Remove rp-* contexts/clusters/users from kubeconfig — but only those that
+# resolve to this project's GKE clusters. Matching only on the alias name
+# (rp-east etc.) would also blow away the user's AWS/Azure contexts when
+# they happen to share the same alias.
 clean_kubectl() {
   local pattern=$1
-  for c in $(kubectl config view -o jsonpath='{.contexts[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-context "$c" 2>/dev/null || true
-  done
-  for n in $(kubectl config view -o jsonpath='{.clusters[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-cluster "$n" 2>/dev/null || true
-  done
-  for n in $(kubectl config view -o jsonpath='{.users[*].name}' 2>/dev/null | tr ' ' '\n' | grep -E "$pattern"); do
-    kubectl config delete-user "$n" 2>/dev/null || true
+  local cluster_pattern="^gke_${PROJECT_ID}_.*_rp-(east|west|eu|failover)$"
+  for ctx in $(kubectl config view -o jsonpath='{.contexts[*].name}' 2>/dev/null \
+                 | tr ' ' '\n' | grep -E "$pattern"); do
+    local cluster
+    cluster=$(kubectl config view -o jsonpath="{.contexts[?(@.name==\"$ctx\")].context.cluster}" 2>/dev/null)
+    if [[ "$cluster" =~ $cluster_pattern ]]; then
+      kubectl config delete-context "$ctx" 2>/dev/null && log "  deleted context $ctx"   || true
+      kubectl config delete-cluster "$cluster" 2>/dev/null && log "  deleted cluster $cluster" || true
+      kubectl config delete-user    "$cluster" 2>/dev/null && log "  deleted user    $cluster" || true
+    else
+      log "  skipping $ctx (cluster=$cluster — not GCP project $PROJECT_ID)"
+    fi
   done
 }
 
@@ -133,9 +141,5 @@ tf_destroy      "$TF_MAIN"
 
 log "=== kubectl cleanup ==="
 clean_kubectl 'rp-(east|west|eu|failover)$'
-
-# GKE leaves cluster/user entries with names like
-# gke_<project>_<region>_rp-east — match those too.
-clean_kubectl "gke_${PROJECT_ID}_.*_rp-(east|west|eu|failover)$"
 
 log "done"
