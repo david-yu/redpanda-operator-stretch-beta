@@ -71,7 +71,7 @@ The asymmetric `2 / 2 / 1` shape — instead of `2 / 2 / 2` or `1 / 1 / 1` — i
 
 The 1-broker `rp-eu` region acts as the **odd-vote tiebreaker** between the two larger regions. Losing it is cheap (you still have four brokers in two regions); losing either two-broker region drops to exactly the quorum minimum, so it's tolerated but tight — replication should already be caught up before a second failure can stack on top. A `1 / 1 / 1` cluster (RF=3) survives a single-region loss too, but with no spare capacity for a concurrent broker failure within a surviving region; `2 / 2 / 1` keeps a one-broker buffer in each large region.
 
-`default_leaders_preference: "racks:<single-region>"` on top of this layout further pins leadership to one region, so steady-state read/write traffic stays inside that region's brokers (lowest latency). The setting accepts multiple racks, but they are treated as a *constrained set* (leaders distributed equally across listed racks), not an ordered fallback list — see [Demo A](#demo-a-leader-pinning--region-failure-fallthrough) for the actual behavior and the AWS-specific cross-Atlantic caveat.
+`default_leaders_preference: "ordered_racks:<r1>,<r2>,…"` on top of this layout pins leadership to the first listed rack while it is healthy, then fails over to `<r2>`, `<r3>`, … as higher-priority racks become unavailable. (See [Redpanda's leader-pinning docs](https://docs.redpanda.com/current/develop/produce-data/leader-pinning/#failover-with-ordered-rack-preference) — the older `racks:<r1>,<r2>,…` format is a *constrained set* with no priority order, intentionally distinct.) The shipped manifests list the primary region first, then the failover region (used by `<cloud>/terraform-failover/`), then the remaining regions, so steady-state read/write traffic stays in the primary region (lowest latency) and a regional outage relocates leadership to the closest healthy rack — see [Demo A](#demo-a-leader-pinning--region-failure-fallthrough).
 
 ## Prerequisites
 
@@ -262,11 +262,12 @@ spec:
       key: license.key
   config:
     cluster:
-      # Single-rack leader pinning — name of the primary region per cloud:
-      #   AWS:   racks:us-east-1
-      #   GCP:   racks:us-east1
-      #   Azure: racks:eastus
-      default_leaders_preference: "racks:us-east1"
+      # Ordered leader pinning — primary region first, failover region (used by
+      # <cloud>/terraform-failover/) second, remaining regions after. Cloud-specific:
+      #   AWS:   ordered_racks:us-east-1,us-east-2,us-west-2,eu-west-1
+      #   GCP:   ordered_racks:us-east1,us-central1,us-west1,us-east4
+      #   Azure: ordered_racks:eastus,eastus2,westus2,centralus
+      default_leaders_preference: "ordered_racks:us-east1,us-central1,us-west1,us-east4"
       partition_autobalancing_node_availability_timeout_sec: 600   # 10 min — long enough for Demo A
       partition_autobalancing_node_autodecommission_timeout_sec: 900   # 15 min — Demo B observation window
 ```
@@ -395,17 +396,17 @@ If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection re
 
 ## Optional demos
 
-The default `stretchcluster.yaml` enables two stretch-cluster-specific features: **rack-aware leader pinning** (so partition leaders are constrained to a single region while it is healthy) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
+The default `stretchcluster.yaml` enables two stretch-cluster-specific features: **rack-aware leader pinning with ordered failover** (partition leaders sit in the primary region while it's healthy and migrate to a designated low-RTT fallback region during an outage) and **automatic broker decommissioning** (a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
 
 The committed defaults are:
 
-| Key | Value | Why |
+| Key | Value (GCP example) | Why |
 |---|---|---|
-| `default_leaders_preference` | `racks:us-east-1` (single rack) | Pin leaders to one region. See note below — multi-rack is *not* an ordered fallback list. |
+| `default_leaders_preference` | `ordered_racks:us-east1,us-central1,us-west1,us-east4` | Ordered leader pinning. The list goes primary → failover → remaining regions, so steady-state read/write traffic stays in the primary region and outages migrate leadership to the closest healthy rack. AWS / Azure use the cloud-equivalent region triples — see each cloud's `<cloud>/manifests/stretchcluster.yaml`. |
 | `partition_autobalancing_node_availability_timeout_sec` | `600` | 10 min — long enough that Demo A's "scale region down → restore" cycle finishes before the autobalancer marks the brokers unavailable. |
 | `partition_autobalancing_node_autodecommission_timeout_sec` | `900` | 15 min — must be > availability timeout. Demo B observes the autodecom kicking in once a broker stays unreachable past this threshold. |
 
-**`default_leaders_preference` is a constrained-set, not an ordered fallback.** Per the [cluster-property docs](https://docs.redpanda.com/current/reference/properties/cluster-properties/), "if you specify multiple IDs, Redpanda tries to distribute the partition leader locations equally across brokers in these racks." So `racks:us-east-1,us-west-2` would balance leaders across us-east-1 *and* us-west-2 (not pin to us-east-1 with us-west-2 as a fallback). To pin leaders to one region, list exactly one rack — that's what these manifests do. When every broker in the listed rack is unreachable, leaders fall through to whichever survivors remain (Redpanda picks them with no rack ordering — see the controller-in-eu-west-1 caveat in [Troubleshooting](#troubleshooting)).
+**`ordered_racks:` vs `racks:` — they have different semantics.** Per [Redpanda's leader-pinning docs](https://docs.redpanda.com/current/develop/produce-data/leader-pinning/#failover-with-ordered-rack-preference), `ordered_racks:<r1>,<r2>,…` (Redpanda 26.1+) "places leaders in the first listed rack when available, failing over to each subsequent rack when higher-priority racks are unavailable." The older `racks:<r1>,<r2>,…` is a *constrained set* — leaders distribute equally across listed racks with no priority order. The shipped manifests use `ordered_racks:` so that during a primary-region outage the cluster relocates leadership to the failover region (listed second) instead of spreading it across all surviving regions.
 
 **Why the timeouts are still demo-fast even at 10 / 15 min.** Production defaults are 900s / 600s; the autodecommission *is the demo* in Demo B, so we must keep autodecom_timeout finite. 15 min is long enough to ride out a transient rolling restart, short enough to finish Demo B in one sitting. **Raise both substantially in production** — a transient regional blip shouldn't trigger an automatic decommission.
 
@@ -413,7 +414,7 @@ Run both demos after step 9 (Quick test) on a healthy cluster.
 
 ### Demo A: leader pinning + region-failure fallthrough
 
-The committed `<cloud>/manifests/stretchcluster.yaml` configures rack-aware leader pinning to a *single* preferred rack:
+The committed `<cloud>/manifests/stretchcluster.yaml` configures rack-aware leader pinning with an ordered failover list — primary region first, then the failover region used by `<cloud>/terraform-failover/`, then the remaining regions:
 
 ```yaml
 rackAwareness:
@@ -422,15 +423,13 @@ rackAwareness:
 
 config:
   cluster:
-    # Single-rack preference. While the listed rack has reachable brokers,
-    # leaders are pinned there. When every broker in that rack is unreachable,
-    # leaders fall through to whichever brokers remain (Redpanda picks them
-    # with no rack ordering — see the controller-in-eu-west-1 caveat below).
-    # The rack name is cloud-specific:
-    #   AWS:   racks:us-east-1
-    #   GCP:   racks:us-east1
-    #   Azure: racks:eastus
-    default_leaders_preference: "racks:us-east-1"
+    # Ordered preference. Leaders sit in the first reachable rack and fall
+    # over to the next listed rack on outage (Redpanda 26.1+ ordered_racks).
+    # Cloud-specific values:
+    #   AWS:   ordered_racks:us-east-1,us-east-2,us-west-2,eu-west-1
+    #   GCP:   ordered_racks:us-east1,us-central1,us-west1,us-east4
+    #   Azure: ordered_racks:eastus,eastus2,westus2,centralus
+    default_leaders_preference: "ordered_racks:us-east-1,us-east-2,us-west-2,eu-west-1"
 ```
 
 Each broker reads its K8s node's `topology.kubernetes.io/region` label and uses it as its rack — so brokers end up tagged with the region they live in (one rack per region). The five steps below use AWS region names as a concrete example; substitute your cloud's names when you read the outputs.
@@ -530,15 +529,14 @@ kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
   rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
 ```
 
-Expected — leaders are spread across the surviving brokers (2, 3, 4) with **no rack ordering**, e.g.:
+Expected — with `ordered_racks` and the failover region not yet brought up (rank 2 is empty), leadership falls through to the next reachable rack in the list. For the AWS preference `ordered_racks:us-east-1,us-east-2,us-west-2,eu-west-1`, that's brokers 3 + 4 (`us-west-2`):
 
 ```
-   2 2
-   5 3
-   5 4
+   6 3
+   6 4
 ```
 
-The exact distribution varies; the point is leaders no longer land on brokers 0 / 1.
+If during the transition you see something like `4 2 / 4 3 / 4 4` (eu-west-1 + us-west-2 + us-west-2), that's the leader balancer mid-convergence — broker 2 (`eu-west-1`, rank 4) is briefly used as a holder while replicas catch up. Wait another 30-60 s; leadership consolidates on the highest-priority reachable rack once partitions are re-replicated.
 
 > **Cross-Atlantic heartbeat caveat (AWS only).** With brokers 0 + 1 down, the controller raft re-elects, and there's a non-trivial chance it lands on broker 2 (`eu-west-1`). Once that happens, the controller's heartbeats to brokers 3 + 4 (`us-west-2`) take ~140 ms RTT, which exceeds Redpanda's hardcoded 100 ms `node_status_rpc` timeout — so the controller silently marks those brokers as `IS-ALIVE=false` even though they're healthy. `rpk cluster health` from rp-eu shows them under `Nodes down:`. The autobalancer reads from the controller, so its decisions go wonky too. If you see this during the demo, manually transfer controller leadership to a closer broker (e.g. `rpk cluster maintenance enable --broker 2` from rp-eu, or kill the rp-eu pod once); GCP's `us-east1`/`us-west1`/`us-east4` triple stays under 100 ms so this caveat does not apply there.
 

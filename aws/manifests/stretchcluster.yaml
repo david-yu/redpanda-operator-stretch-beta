@@ -37,22 +37,24 @@ spec:
   # defaults are 900s / 600s) so a transient outage doesn't trigger a decommission.
   config:
     cluster:
-      # Constrains partition leaders to brokers in the listed rack(s). When
-      # multiple racks are listed Redpanda distributes leaders equally across
-      # them — there is NO ordered/priority fallback. So a single-rack value
-      # is what actually pins leaders to one region; multi-rack values just
-      # restrict the eligible set. Cluster-property docs:
-      # https://docs.redpanda.com/current/reference/properties/cluster-properties/
-      #   "If you specify multiple IDs, Redpanda tries to distribute the
-      #    partition leader locations equally across brokers in these racks."
-      # When every broker in the preferred rack is unreachable, leaders fall
-      # through to whichever brokers remain — Redpanda picks them however it
-      # likes (no rack ordering), so during a us-east-1 outage the controller
-      # may land in eu-west-1, where the ~140ms RTT to us-west-2 exceeds the
-      # partition balancer's 100ms node_status_rpc timeout. See troubleshooting
-      # for the manual recovery (transfer controller leadership to a closer
-      # broker before relying on auto-decommission).
-      default_leaders_preference: "racks:us-east-1"
+      # Ordered failover preference. Redpanda 26.1+ accepts two formats:
+      #   - "racks:<r1>,<r2>,…"          — distributes leaders equally across
+      #                                    listed racks (no priority order)
+      #   - "ordered_racks:<r1>,<r2>,…"  — places leaders in the FIRST listed
+      #                                    rack with reachable brokers, falling
+      #                                    over to <r2>, <r3>, … if higher-
+      #                                    priority racks are all unavailable
+      # https://docs.redpanda.com/current/develop/produce-data/leader-pinning/
+      #
+      # We use ordered_racks so that during a primary-region outage the
+      # leader balancer relocates to a low-RTT fallback (us-east-2 — the
+      # default failover region in aws/terraform-failover) before falling
+      # through to us-west-2 / eu-west-1. The eu-west-1 ↔ us-west-2 RTT
+      # (~140 ms) exceeds Redpanda's hardcoded 100 ms node_status_rpc
+      # timeout, so listing eu-west-1 last keeps it as a last-resort
+      # leader-host and avoids the cluster-health corruption we'd see if
+      # leadership concentrated there.
+      default_leaders_preference: "ordered_racks:us-east-1,us-east-2,us-west-2,eu-west-1"
       # Time a broker can be unreachable before it's marked unavailable for
       # partition movement. 10 min so Demo A's "scale region to 0 → restore"
       # cycle finishes before the autobalancer marks the brokers unavailable
