@@ -83,3 +83,11 @@ variable "cross_cluster_ports" {
   type        = list(number)
   default     = [9443, 33145, 9093, 8082, 9644]
 }
+
+# AWS Load Balancer Controller chart version — must match main stack so the
+# peer Service annotations behave identically.
+variable "lbc_chart_version" {
+  description = "Chart version for aws-load-balancer-controller on the failover cluster."
+  type        = string
+  default     = "1.13.0"
+}

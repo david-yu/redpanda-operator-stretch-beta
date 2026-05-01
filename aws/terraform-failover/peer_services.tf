@@ -3,14 +3,10 @@
 # existing Service via CreateOrUpdate, preserving the AWS-LBC annotations
 # that make it an internal NLB (instead of a vanilla internet-facing ELB).
 #
-# NOTE: this depends on the AWS Load Balancer Controller being installed
-# on the failover cluster. The main stack installs LBC via Helm; we don't
-# duplicate that here since adding it would require a separate Helm release
-# in this stack. If the failover cluster doesn't have LBC, the Service
-# stays Pending and bootstrap fails. Two options:
-#   A) install LBC on rp-failover by hand: `helm install aws-load-balancer-controller ...`
-#      using the same chart version as the main stack
-#   B) re-use the main stack's `aws/terraform/lbc.tf` block and copy it here
+# Depends on the AWS Load Balancer Controller — see lbc.tf in this stack
+# for the IRSA role + helm release that installs it. Without LBC running,
+# the Service stays Pending and terraform apply hangs forever waiting for
+# `.status.loadBalancer.ingress`.
 
 resource "kubernetes_namespace" "redpanda_failover" {
   metadata { name = "redpanda" }
@@ -41,6 +37,8 @@ resource "kubernetes_service" "peer_failover" {
     }
     publish_not_ready_addresses = true
   }
+
+  depends_on = [helm_release.lbc_failover]
 }
 
 data "kubernetes_service" "peer_failover" {

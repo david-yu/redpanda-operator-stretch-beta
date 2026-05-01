@@ -11,9 +11,8 @@ This stack is **independent** — it does not modify the main stack's terraform 
 | Cross-region | New TGW in failover region, VPC attachment, **3 peering attachments** (failover ↔ each existing), accepters in the existing regions, **6 TGW routes** (3 in failover TGW, 3 in existing TGWs) | uses `aws.east` / `aws.west` / `aws.eu` provider aliases for the accepters and TGW route updates |
 | VPC routes | Failover VPC route tables learn 3 existing CIDRs; each existing VPC's route tables learn the failover CIDR | the existing route tables are looked up via `aws_route_tables` data source on the existing VPC IDs |
 | Security | Failover node SG ingress from existing CIDRs (and own CIDR for NLB SNAT); each existing node SG gains failover-CIDR ingress on the 5 stretch ports | existing node SGs looked up by `tag:Name = "<cluster>-node"` (the EKS module's default) |
-| Bootstrap | redpanda namespace + peer LB Service (internal NLB via AWS LBC annotations) | the AWS LB Controller must be installed on the failover cluster — see note below |
-
-> ⚠ **AWS LB Controller install.** The peer Service's internal-NLB annotations require the AWS Load Balancer Controller to be running on the failover cluster. The main `aws/terraform/lbc.tf` block installs it via Helm in each existing cluster, but this stack doesn't duplicate that — keeping the failover stack focused on networking + cluster, with operator/cert-manager/LBC layered on top by the user (Demo B step 4). If you skip the LBC install, the peer Service stays `Pending` and bootstrap fails. Two options: (a) `helm install aws-load-balancer-controller ...` against rp-failover by hand using the same chart version as the main stack (`var.lbc_chart_version` in `aws/terraform/variables.tf`), or (b) copy `aws/terraform/lbc.tf` into this stack and parameterize for the failover cluster.
+| AWS LB Controller | IRSA role + service account + helm release | mirrors `aws/terraform/lbc.tf` — required so the peer LB Service below can provision its internal NLB. Chart version: `var.lbc_chart_version` (default `1.13.0`, must match the main stack) |
+| Bootstrap | redpanda namespace + peer LB Service (internal NLB via AWS LBC annotations) | depends on `helm_release.lbc_failover` so terraform doesn't try to create the Service before LBC is reconciling it |
 
 ## Prerequisites
 
