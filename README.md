@@ -1,6 +1,6 @@
 # Redpanda Operator v26.2.1-beta.1 — Stretch Cluster on AWS, GCP, or Azure
 
-A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Validated end-to-end on AWS EKS (Transit Gateway across `us-east-1`/`us-west-2`/`eu-west-1`); GCP and Azure Terraform configs follow the same pattern but have not yet been run end-to-end in this repo.
+A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Validated end-to-end most recently on **GCP / GKE** (`us-east1` / `us-west1` / `us-east4`, with `us-central1` as the failover region) — both Demo A (leader pinning) and Demo B (failover capacity injection) run cleanly. Validated on **AWS / EKS** (Transit Gateway across `us-east-1` / `us-west-2` / `eu-west-1`) for the bring-up and Demo A; Demo B exposes two AWS-specific gotchas worth knowing about (cross-Atlantic RTT exceeds Redpanda's hardcoded 100 ms heartbeat timeout, and the operator startup requires every peer reachable) — both [documented inline](#demo-b-regional-failure--temporary-failover-region-capacity-injection). **Azure / AKS** has working terraform but no end-to-end validation in this repo yet.
 
 This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The `aws/`, `gcp/`, and `azure/` directories each bundle the terraform, manifests, and helm-values that actually work for that cloud — see [Troubleshooting](#troubleshooting) for the why behind each one.
 
@@ -20,7 +20,7 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [8. Validate stretch cluster health using rpk k8s multicluster](#8-validate-stretch-cluster-health-using-rpk-k8s-multicluster)
   - [9. Quick test — produce and consume across clusters](#9-quick-test--produce-and-consume-across-clusters)
 - [Optional demos](#optional-demos)
-  - [Demo A: ordered leader pinning + region-failover fallback](#demo-a-ordered-leader-pinning--region-failover-fallback)
+  - [Demo A: leader pinning + region-failure fallthrough](#demo-a-leader-pinning--region-failure-fallthrough)
   - [Demo B: regional failure + temporary failover-region capacity injection](#demo-b-regional-failure--temporary-failover-region-capacity-injection)
 - [Tear down](#tear-down)
 - [Troubleshooting](#troubleshooting)
@@ -71,7 +71,7 @@ The asymmetric `2 / 2 / 1` shape — instead of `2 / 2 / 2` or `1 / 1 / 1` — i
 
 The 1-broker `rp-eu` region acts as the **odd-vote tiebreaker** between the two larger regions. Losing it is cheap (you still have four brokers in two regions); losing either two-broker region drops to exactly the quorum minimum, so it's tolerated but tight — replication should already be caught up before a second failure can stack on top. A `1 / 1 / 1` cluster (RF=3) survives a single-region loss too, but with no spare capacity for a concurrent broker failure within a surviving region; `2 / 2 / 1` keeps a one-broker buffer in each large region.
 
-`default_leaders_preference: "racks:<region1>,<region2>,<region3>"` on top of this layout further makes leadership land in the first listed region whenever possible, so steady-state read/write traffic stays inside one region's brokers (lowest latency); leaders only fall through to the second/third region during an outage, which is what [Demo A](#demo-a-ordered-leader-pinning--region-failover-fallback) exercises.
+`default_leaders_preference: "racks:<single-region>"` on top of this layout further pins leadership to one region, so steady-state read/write traffic stays inside that region's brokers (lowest latency). The setting accepts multiple racks, but they are treated as a *constrained set* (leaders distributed equally across listed racks), not an ordered fallback list — see [Demo A](#demo-a-leader-pinning--region-failure-fallthrough) for the actual behavior and the AWS-specific cross-Atlantic caveat.
 
 ## Prerequisites
 
@@ -205,7 +205,7 @@ Note the **helm release name == cluster context name**. This makes the chart's `
 Confirm:
 
 ```bash
-rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu -n redpanda
+rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu --namespace redpanda
 ```
 
 You should see `OPERATOR=Running`, one cluster as `StateLeader`, all `PEERS=3`, `UNHEALTHY=0`, and the four cross-cluster checks ✓.
@@ -262,13 +262,13 @@ spec:
       key: license.key
   config:
     cluster:
-      # Ordered leader pinning — rack list is cloud-specific:
-      #   AWS:   racks:us-east-1,us-west-2,eu-west-1
-      #   GCP:   racks:us-east1,us-west1,us-east4
-      #   Azure: racks:eastus,westus2,westeurope
-      default_leaders_preference: "racks:us-east1,us-west1,us-east4"
-      partition_autobalancing_node_availability_timeout_sec: 30   # demo-fast (default 900)
-      partition_autobalancing_node_autodecommission_timeout_sec: 60   # demo-fast (default 600)
+      # Single-rack leader pinning — name of the primary region per cloud:
+      #   AWS:   racks:us-east-1
+      #   GCP:   racks:us-east1
+      #   Azure: racks:eastus
+      default_leaders_preference: "racks:us-east1"
+      partition_autobalancing_node_availability_timeout_sec: 600   # 10 min — long enough for Demo A
+      partition_autobalancing_node_autodecommission_timeout_sec: 900   # 15 min — Demo B observation window
 ```
 
 **`<cloud>/manifests/nodepool-rp-east.yaml`** (rp-west uses an identical shape with `name: rp-west`; rp-eu uses `replicas: 1`):
@@ -328,7 +328,7 @@ Two checks confirm the cluster is fully wired up — one for the operator/raft l
 **Operator + cross-cluster raft.** `rpk k8s multicluster status` connects to every operator pod (one per K8s cluster) over the bootstrap-managed mTLS, prints the raft role each one currently holds, and runs four cross-cluster sanity checks: that no two operators picked the same node name, that all operators agree on which peers exist, that they all agree on who the raft leader is at the same term, and that they all carry the same shared CA. A healthy install reports `OPERATOR=Running` everywhere, exactly one `StateLeader` and the rest `StateFollower`, `PEERS=3`, `UNHEALTHY=0`, `TLS=ok`, `SECRETS=ok`, and ✓ on all four cross-cluster checks:
 
 ```
-$ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu -n redpanda
+$ rpk k8s multicluster status --context rp-east --context rp-west --context rp-eu --namespace redpanda
 CLUSTER  OPERATOR  RAFT-STATE     LEADER  PEERS  UNHEALTHY  TLS  SECRETS
 rp-east  Running   StateFollower  rp-eu   3      0          ok   ok
 rp-west  Running   StateFollower  rp-eu   3      0          ok   ok
@@ -345,11 +345,15 @@ CROSS-CLUSTER:
 
 ```
 $ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- rpk redpanda admin brokers list
-ID    HOST                         PORT   RACK  CORES  MEMBERSHIP  IS-ALIVE  VERSION
-0     redpanda-rp-east-0.redpanda  33145  -     1      active      true      26.1.6
-1     redpanda-rp-eu-0.redpanda    33145  -     1      active      true      26.1.6
-2     redpanda-rp-west-0.redpanda  33145  -     1      active      true      26.1.6
+ID    HOST                         PORT   RACK       CORES  MEMBERSHIP  IS-ALIVE  VERSION  UUID
+0     redpanda-rp-east-0.redpanda  33145  us-east-1  1      active      true      26.1.6   52351fe6-…
+1     redpanda-rp-east-1.redpanda  33145  us-east-1  1      active      true      26.1.6   78f90065-…
+2     redpanda-rp-eu-0.redpanda    33145  eu-west-1  1      active      true      26.1.6   72ecf5ff-…
+3     redpanda-rp-west-0.redpanda  33145  us-west-2  1      active      true      26.1.6   3bda1c04-…
+4     redpanda-rp-west-1.redpanda  33145  us-west-2  1      active      true      26.1.6   bad54b3e-…
 ```
+
+All 5 brokers from the 2 / 2 / 1 layout should appear with their rack labels populated (each broker's K8s node `topology.kubernetes.io/region` flows into the rack column).
 
 If `rpk multicluster status` looks healthy but `brokers list` doesn't show all the expected brokers, suspect a broker-network problem (firewall/SG missing port 33145, or `crossClusterMode` not set to `flat`); see [Troubleshooting](#troubleshooting) issues 6 and 9.
 
@@ -358,14 +362,16 @@ If `rpk multicluster status` looks healthy but `brokers list` doesn't show all t
 Verify Kafka actually works end-to-end across the three clusters:
 
 ```bash
-# Create a topic with one replica per cluster
+# Create a topic with RF=3 — Redpanda picks 3 of the 5 brokers per partition
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk topic create stretch-test --partitions 6 --replicas 3
 
-# Confirm replicas span all 3 brokers
+# Confirm partitions are spread across all 5 brokers
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk topic describe stretch-test -p
-# Expect REPLICAS=[0 1 2] on every partition.
+# Each row's REPLICAS is a 3-broker subset of {0..4}; subsets vary per partition
+# (e.g. [0 2 4], [1 2 3], [0 2 3]). Across all 6 partitions every broker should
+# appear at least once.
 
 # Produce keyed messages from rp-eu (Kafka controller cluster)
 kubectl --context rp-eu -n redpanda exec sts/redpanda-rp-eu -c redpanda -- \
@@ -389,23 +395,25 @@ If any of these fail with `i/o timeout` or `dial tcp ...: connect: connection re
 
 ## Optional demos
 
-The default `stretchcluster.yaml` enables two stretch-cluster-specific features: **rack awareness with ordered leader pinning** (so partition leaders land in your preferred region first) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
+The default `stretchcluster.yaml` enables two stretch-cluster-specific features: **rack-aware leader pinning** (so partition leaders are constrained to a single region while it is healthy) and **automatic broker decommissioning** (so a permanently-gone broker gets evicted from the cluster). Both demos below run end-to-end with **no extra `rpk cluster config set` steps** — the relevant cluster config keys are committed into `<cloud>/manifests/stretchcluster.yaml` and applied at deploy time.
 
 The committed defaults are:
 
 | Key | Value | Why |
 |---|---|---|
-| `default_leaders_preference` | `racks:us-east-1,us-west-2,eu-west-1` | Ordered leader pinning. |
-| `partition_autobalancing_node_availability_timeout_sec` | `30` | Demo-fast (default 900s). |
-| `partition_autobalancing_node_autodecommission_timeout_sec` | `60` | Demo-fast (default 600s). |
+| `default_leaders_preference` | `racks:us-east-1` (single rack) | Pin leaders to one region. See note below — multi-rack is *not* an ordered fallback list. |
+| `partition_autobalancing_node_availability_timeout_sec` | `600` | 10 min — long enough that Demo A's "scale region down → restore" cycle finishes before the autobalancer marks the brokers unavailable. |
+| `partition_autobalancing_node_autodecommission_timeout_sec` | `900` | 15 min — must be > availability timeout. Demo B observes the autodecom kicking in once a broker stays unreachable past this threshold. |
 
-The autobalancer timeouts are tuned aggressively so the demos finish in 2–3 minutes. **Raise these substantially before using a stretch cluster in production** — a transient regional blip shouldn't trigger an automatic decommission.
+**`default_leaders_preference` is a constrained-set, not an ordered fallback.** Per the [cluster-property docs](https://docs.redpanda.com/current/reference/properties/cluster-properties/), "if you specify multiple IDs, Redpanda tries to distribute the partition leader locations equally across brokers in these racks." So `racks:us-east-1,us-west-2` would balance leaders across us-east-1 *and* us-west-2 (not pin to us-east-1 with us-west-2 as a fallback). To pin leaders to one region, list exactly one rack — that's what these manifests do. When every broker in the listed rack is unreachable, leaders fall through to whichever survivors remain (Redpanda picks them with no rack ordering — see the controller-in-eu-west-1 caveat in [Troubleshooting](#troubleshooting)).
+
+**Why the timeouts are still demo-fast even at 10 / 15 min.** Production defaults are 900s / 600s; the autodecommission *is the demo* in Demo B, so we must keep autodecom_timeout finite. 15 min is long enough to ride out a transient rolling restart, short enough to finish Demo B in one sitting. **Raise both substantially in production** — a transient regional blip shouldn't trigger an automatic decommission.
 
 Run both demos after step 9 (Quick test) on a healthy cluster.
 
-### Demo A: ordered leader pinning + region-failover fallback
+### Demo A: leader pinning + region-failure fallthrough
 
-The committed `<cloud>/manifests/stretchcluster.yaml` configures rack-aware leader pinning:
+The committed `<cloud>/manifests/stretchcluster.yaml` configures rack-aware leader pinning to a *single* preferred rack:
 
 ```yaml
 rackAwareness:
@@ -414,14 +422,15 @@ rackAwareness:
 
 config:
   cluster:
-    # Ordered preference. The leader balancer places partition leaders in the
-    # FIRST listed rack with available brokers; if every broker in that rack
-    # is unreachable, it falls through to the next, and so on.
-    # The rack list is cloud-specific:
-    #   AWS:   racks:us-east-1,us-west-2,eu-west-1
-    #   GCP:   racks:us-east1,us-west1,us-east4
-    #   Azure: racks:eastus,westus2,westeurope
-    default_leaders_preference: "racks:us-east-1,us-west-2,eu-west-1"
+    # Single-rack preference. While the listed rack has reachable brokers,
+    # leaders are pinned there. When every broker in that rack is unreachable,
+    # leaders fall through to whichever brokers remain (Redpanda picks them
+    # with no rack ordering — see the controller-in-eu-west-1 caveat below).
+    # The rack name is cloud-specific:
+    #   AWS:   racks:us-east-1
+    #   GCP:   racks:us-east1
+    #   Azure: racks:eastus
+    default_leaders_preference: "racks:us-east-1"
 ```
 
 Each broker reads its K8s node's `topology.kubernetes.io/region` label and uses it as its rack — so brokers end up tagged with the region they live in (one rack per region). The five steps below use AWS region names as a concrete example; substitute your cloud's names when you read the outputs.
@@ -433,18 +442,18 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk redpanda admin brokers list
 ```
 
-Expected output — every broker has a `RACK` value matching its region:
+Expected output — every broker has a `RACK` value matching its region (the `UUID` column was added in recent rpk versions; older outputs end at `VERSION`):
 
 ```
-ID    HOST                         PORT   RACK       CORES  MEMBERSHIP  IS-ALIVE  VERSION
-0     redpanda-rp-east-0.redpanda  33145  us-east-1  1      active      true      26.1.6
-1     redpanda-rp-east-1.redpanda  33145  us-east-1  1      active      true      26.1.6
-2     redpanda-rp-eu-0.redpanda    33145  eu-west-1  1      active      true      26.1.6
-3     redpanda-rp-west-0.redpanda  33145  us-west-2  1      active      true      26.1.6
-4     redpanda-rp-west-1.redpanda  33145  us-west-2  1      active      true      26.1.6
+ID    HOST                         PORT   RACK       CORES  MEMBERSHIP  IS-ALIVE  VERSION  UUID
+0     redpanda-rp-east-0.redpanda  33145  us-east-1  1      active      true      26.1.6   52351fe6-…
+1     redpanda-rp-east-1.redpanda  33145  us-east-1  1      active      true      26.1.6   78f90065-…
+2     redpanda-rp-eu-0.redpanda    33145  eu-west-1  1      active      true      26.1.6   72ecf5ff-…
+3     redpanda-rp-west-0.redpanda  33145  us-west-2  1      active      true      26.1.6   3bda1c04-…
+4     redpanda-rp-west-1.redpanda  33145  us-west-2  1      active      true      26.1.6   bad54b3e-…
 ```
 
-**Step 2 — create the demo topic and watch leaders concentrate in the rank-1 rack**
+**Step 2 — create the demo topic and watch leaders concentrate in the preferred rack**
 
 Create a 12-partition topic with RF=5 (so every partition has a replica on every broker):
 
@@ -466,7 +475,7 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
   rpk topic describe leader-pinning-demo -p
 ```
 
-Expected — every replica list contains all 5 brokers, and every leader is broker 0 or 1 (the two rank-1 brokers in `us-east-1`):
+Expected — every replica list contains all 5 brokers, and every leader is broker 0 or 1 (the two `us-east-1` brokers in the preferred rack):
 
 ```
 PARTITION  LEADER  EPOCH  REPLICAS     LOG-START-OFFSET  HIGH-WATERMARK
@@ -496,58 +505,54 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
    6 1
 ```
 
-— all 12 leaders on the two `us-east-1` brokers (rank 1), evenly split.
+— all 12 leaders on the two `us-east-1` brokers (the preferred rack), evenly split.
 
-**Step 3 — simulate the rank-1 region failing**
+**Step 3 — simulate the preferred region failing**
 
-Scale the rp-east StatefulSet to 0:
+`kubectl scale sts redpanda-rp-east --replicas=0` does **not** work for this — the operator on every peer cluster reconciles the rp-east `NodePool` cross-cluster (via the kubeconfig secrets bootstrapped in step 3) and brings the StatefulSet back up within ~60 s. Likewise, patching the `NodePool` to `replicas: 0` triggers a *graceful* decommission, which stalls under RF=5 (the autobalancer has nowhere to land replicas) — so the brokers also stay up, just in a `condemned` state.
 
-```bash
-kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
-```
-
-```
-statefulset.apps/redpanda-rp-east scaled
-```
-
-**Step 4 — confirm leaders fall through to the rank-2 rack**
-
-Wait ~90 s for brokers to terminate, partitions to re-replicate, and the leader balancer to converge on the next-priority rack:
+To simulate a true regional outage (brokers unreachable, no graceful drain), cordon every node in the rp-east K8s cluster and delete the broker pods. The operator can keep `replicas: 2` on the StatefulSet, but with all nodes cordoned the new pods sit `Pending`:
 
 ```bash
-sleep 90
+for N in $(kubectl --context rp-east get nodes -o name); do
+  kubectl --context rp-east cordon "$N"
+done
+kubectl --context rp-east -n redpanda delete pod redpanda-rp-east-0 redpanda-rp-east-1 --grace-period=10
+```
+
+**Step 4 — confirm leaders fall through to the surviving brokers**
+
+Wait ~2 min for the brokers to be marked unreachable and for the leader balancer to relocate leaders. Run the tally from a *surviving* cluster (rp-east's API is gone):
+
+```bash
+sleep 120
 kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
   rpk topic describe leader-pinning-demo -p | awk 'NR>1 {print $2}' | sort | uniq -c
 ```
 
-Expected — leaders migrate off brokers 0 + 1 to brokers 3 + 4 (`us-west-2`, rank 2):
+Expected — leaders are spread across the surviving brokers (2, 3, 4) with **no rack ordering**, e.g.:
 
 ```
-   6 3
-   6 4
+   2 2
+   5 3
+   5 4
 ```
 
-If during a transition you see something like:
+The exact distribution varies; the point is leaders no longer land on brokers 0 / 1.
 
-```
-   4 2
-   4 3
-   4 4
-```
-
-that's the leader balancer mid-convergence — broker 2 (`eu-west-1`, rank 3) was used as a temporary holder for partitions whose preferred replicas weren't yet caught up. Wait another 30–60 s and re-tally; leadership consolidates on `us-west-2` once partitions are re-replicated there.
+> **Cross-Atlantic heartbeat caveat (AWS only).** With brokers 0 + 1 down, the controller raft re-elects, and there's a non-trivial chance it lands on broker 2 (`eu-west-1`). Once that happens, the controller's heartbeats to brokers 3 + 4 (`us-west-2`) take ~140 ms RTT, which exceeds Redpanda's hardcoded 100 ms `node_status_rpc` timeout — so the controller silently marks those brokers as `IS-ALIVE=false` even though they're healthy. `rpk cluster health` from rp-eu shows them under `Nodes down:`. The autobalancer reads from the controller, so its decisions go wonky too. If you see this during the demo, manually transfer controller leadership to a closer broker (e.g. `rpk cluster maintenance enable --broker 2` from rp-eu, or kill the rp-eu pod once); GCP's `us-east1`/`us-west1`/`us-east4` triple stays under 100 ms so this caveat does not apply there.
 
 **Step 5 — restore the primary and watch leaders return**
 
+Uncordon the rp-east nodes; the pending broker pods schedule immediately:
+
 ```bash
-kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=2
+for N in $(kubectl --context rp-east get nodes -o name); do
+  kubectl --context rp-east uncordon "$N"
+done
 ```
 
-```
-statefulset.apps/redpanda-rp-east scaled
-```
-
-Brokers rejoin (~60 s), partitions catch up, the leader balancer moves leaders back to `us-east-1` (rank 1). After ~2 min:
+Brokers rejoin (~60 s), partitions catch up, the leader balancer moves leaders back to `us-east-1`. After ~2 min:
 
 ```bash
 kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
@@ -561,42 +566,48 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
 
 **Caveats observed during validation:**
 
-- The leader balancer **stalls during under-replicated periods** — when half a region's brokers go away, it pauses while the cluster is recovering, then resumes once partitions are re-replicated. Expect 30–90 s of "leaders not yet on the rank-2 rack" while replicas are being rebuilt elsewhere.
-- Cross-region heartbeats can flap during transitions — `rpk redpanda admin brokers list` may briefly show un-affected brokers as `IS-ALIVE=false`. Confirm against `rpk cluster health` (`Nodes down:` field) which uses the controller's authoritative view.
+- The leader balancer **stalls during under-replicated periods** — when half a region's brokers go away, it pauses while the cluster is recovering, then resumes once partitions are re-replicated. Expect 30–90 s of "leaders not yet redistributed" while replicas are being rebuilt elsewhere.
+- Cross-region heartbeats can flap during transitions — `rpk redpanda admin brokers list` may briefly show un-affected brokers as `IS-ALIVE=false`. Confirm against `rpk cluster health` (`Nodes down:` field) which uses the controller's authoritative view, except when the controller itself sits across the > 100 ms RTT line described in the caveat above.
 
 ### Demo B: regional failure + temporary failover-region capacity injection
 
 The 2 / 2 / 1 broker layout with `RF=5` survives a single-region outage in terms of *quorum* (3 of 5 brokers remain), but it cannot *self-heal* RF: with `RF=5` and only 3 reachable brokers, the partition autobalancer has nowhere to rebuild the missing two replicas, so:
 
-- The two brokers from the lost region get marked unavailable after `partition_autobalancing_node_availability_timeout_sec` (30s)
-- Auto-decommission would normally start after `partition_autobalancing_node_autodecommission_timeout_sec` (60s), but it stalls (`partition_balancer/status: "stalled"`) because there's no way to rehome the replicas
+- The two brokers from the lost region get marked unavailable after `partition_autobalancing_node_availability_timeout_sec` (10 min)
+- Auto-decommission would normally start after `partition_autobalancing_node_autodecommission_timeout_sec` (15 min), but it stalls (`partition_balancer/status: "stalled"`) because there's no way to rehome the replicas
 - Brokers from the lost region stay in `draining`/`active` indefinitely, and every `RF=5` topic shows under-replicated partitions
 
 The operational fix is to **add capacity in a fourth, separate failover region**. As soon as the cluster has 5 reachable brokers again, re-replication unblocks, the autobalancer drains the two lost brokers, and the cluster returns to RF=5 across the new layout. This demo walks through the full sequence: simulate the regional failure, observe the stall, deploy the failover region, watch recovery, then restore the primary and decommission the failover.
 
+> **AWS-specific gotchas validated end-to-end (April 2026).** Demo B as written runs cleanly on GCP (where us-east1 ↔ us-west1 ↔ us-east4 are all under 100 ms RTT), but on AWS the eu-west-1 ↔ us-west-2 leg (~140 ms) trips two product limits that you'll have to work around:
+>
+> 1. **Cross-Atlantic heartbeat timeouts corrupt the cluster view.** When the controller raft leader lands in eu-west-1 (broker 2), it can't heartbeat us-west-2 brokers within Redpanda's hardcoded 100 ms `node_status_rpc` timeout. From eu-west-1's view, brokers 3+4 appear `IS-ALIVE=false` even though they're healthy; from us-west-2's view, broker 2 appears `IS-ALIVE=false` for the same reason. `partition_balancer/status` then reports the wrong `unavailable_nodes` set (you'll see `[2]` instead of `[0, 1]`), and the autobalancer makes decisions based on the wrong data. The workaround is to manually transfer controller leadership to a us-west-2 broker right after step 1 (`rpk cluster partitions transfer-leadership --partition redpanda/controller/0:3`) — see the AWS-only callout in step 1 below.
+>
+> 2. **The rp-failover operator's startup requires all peers reachable.** The multicluster operator pod fetches kubeconfigs from every peer at startup (over the bootstrap-distributed mTLS LBs); if any peer's NLB is unreachable, startup blocks indefinitely on `name resolver error: produced zero addresses`. With rp-east cordoned, AWS LBC may also have reaped its NLB by the time you bring up rp-failover, so the DNS doesn't resolve at all from the failover region. Working around this requires temporarily un-cordoning rp-east just long enough for rp-failover's operator to fetch peer kubeconfigs, then re-cordoning to continue the demo. GCP doesn't hit this in our validation because none of the regions sit cross-Atlantic.
+>
+> If you're demoing on AWS, expect to do these workarounds by hand. GCP is the cleaner end-to-end story.
+
 **Step 1 — simulate the regional failure**
 
-```bash
-kubectl --context rp-east -n redpanda scale sts redpanda-rp-east --replicas=0
-```
-
-After ~90s (30s availability + 60s autodecom timeouts), check broker state from a surviving region:
+Use the same cordon-and-delete approach as Demo A (a plain `kubectl scale sts ... --replicas=0` gets reverted by the cross-cluster operator reconciler):
 
 ```bash
-kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
-  rpk redpanda admin brokers list
+for N in $(kubectl --context rp-east get nodes -o name); do
+  kubectl --context rp-east cordon "$N"
+done
+kubectl --context rp-east -n redpanda delete pod redpanda-rp-east-0 redpanda-rp-east-1 --grace-period=10
 ```
 
-```
-ID  HOST                         RACK      MEMBERSHIP  IS-ALIVE
-0   redpanda-rp-east-0.redpanda  us-east1  active      false
-1   redpanda-rp-east-1.redpanda  us-east1  draining    false
-2   redpanda-rp-eu-0.redpanda    us-east4  active      true
-3   redpanda-rp-west-0.redpanda  us-west1  active      true
-4   redpanda-rp-west-1.redpanda  us-west1  active      true
-```
+> **AWS-only: transfer controller leadership out of `eu-west-1` immediately.** With brokers 0+1 down, controller raft re-elects, and there's a non-trivial chance it lands on broker 2 (`eu-west-1`). The ~140 ms RTT to `us-west-2` exceeds Redpanda's hardcoded 100 ms `node_status_rpc` timeout, which silently breaks the autobalancer's view of broker availability — you'll see broker 2 *and* the us-west-2 brokers reported as `IS-ALIVE=false` from various viewpoints, and the partition balancer stalls on the wrong nodes (`unavailable_nodes: [2]` instead of `[0, 1]`). Check `curl https://localhost:9644/v1/partitions/redpanda/controller/0` from any reachable broker — if `leader_id` is `2`, transfer it to a us-west-2 broker:
+>
+> ```bash
+> kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
+>   rpk cluster partitions transfer-leadership --partition redpanda/controller/0:3
+> ```
+>
+> GCP's `us-east1`/`us-west1`/`us-east4` triple stays under 100 ms RTT, so this caveat does not apply there.
 
-**Step 2 — confirm the partition autobalancer is stalled**
+After ~10 min (`partition_autobalancing_node_availability_timeout_sec`) + ~5 min more (`autodecom_timeout − availability_timeout` = 15 min − 10 min), check cluster state from a surviving region. **Use `rpk cluster health`, not `rpk redpanda admin brokers list`** — the latter shows each broker's local heartbeat-monitor view, which diverges across viewpoints under a regional outage and can show healthy brokers as `IS-ALIVE=false`. `cluster health` reports the controller's authoritative `Nodes down:` set:
 
 ```bash
 kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
@@ -606,10 +617,13 @@ kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
 ```
 Healthy:                          false
 Unhealthy reasons:                [nodes_down under_replicated_partitions]
+Controller ID:                    3
 All nodes:                        [0 1 2 3 4]
 Nodes down:                       [0 1]
 Under-replicated partitions:      18      # all RF=5 topics across the cluster
 ```
+
+**Step 2 — confirm the partition autobalancer is stalled**
 
 The autobalancer status itself confirms the stall (admin API on any reachable broker):
 
@@ -627,6 +641,8 @@ kubectl --context rp-west -n redpanda exec sts/redpanda-rp-west -c redpanda -- \
   "current_reassignments_count": 0
 }
 ```
+
+If `unavailable_nodes` lists a different set than `[0, 1]` (e.g. `[2]` — broker 2 in `eu-west-1`), the controller has landed on a broker that can't heartbeat the rest of the cluster within Redpanda's 100 ms timeout. Re-do the controller transfer from the AWS-only callout above.
 
 **Step 3 — provision a fourth K8s cluster + cross-region networking (rp-failover)**
 
@@ -656,7 +672,7 @@ terraform output -raw failover_eks_endpoint        # AWS   → multicluster.apiS
 terraform output -raw failover_aks_fqdn            # Azure → prefix with https:// for apiServerExternalAddress
 ```
 
-> AWS only: the failover cluster needs the AWS Load Balancer Controller installed before the peer Service can provision an internal NLB. The terraform-failover stack does not install it (to keep cross-cloud parity); see [`aws/terraform-failover/README.md`](aws/terraform-failover/README.md#prerequisites) for the helm-install snippet to run after `terraform apply` and before bootstrap.
+> AWS-only note: the failover cluster needs the AWS Load Balancer Controller running before the peer Service can provision its internal NLB. The terraform-failover stack handles this for you (`lbc.tf` mirrors the main stack's IRSA + helm-release setup), so a fresh `terraform apply` brings up LBC and the peer Service in one shot. If you ran an older revision of this stack that didn't ship `lbc.tf`, the `kubernetes_service.peer_failover` resource will hang on `LoadBalancer Pending` — `terraform state rm kubernetes_service.peer_failover && terraform apply` after pulling latest will fix it.
 
 **Step 4 — bootstrap, install, apply manifests on the failover cluster (cloud-agnostic)**
 
@@ -729,11 +745,11 @@ You don't need to issue any `rpk redpanda admin brokers decommission` here. The 
 
 | Phase | What the autobalancer is doing |
 |---|---|
-| step 1 (t≈30s)  | brokers 0, 1 marked `IS-ALIVE=false` after `partition_autobalancing_node_availability_timeout_sec` (30s) |
-| step 1 (t≈90s)  | decommission issued for broker 1 (or broker 0 — autobalancer drains one at a time) → enters `draining` |
-| step 1 → step 4 | drain stalled; status flips to `"stalled"` because RF=5 has nowhere to rebuild replicas |
-| step 4 done    | brokers 5, 6 join; 5 reachable brokers → autobalancer status flips back to `"ready"` |
-| step 5 onward  | drain resumes on broker 1, completes, broker 1 evicted; decom issued for broker 0; same cycle |
+| step 1 (t≈10 min) | brokers 0, 1 marked `IS-ALIVE=false` after `partition_autobalancing_node_availability_timeout_sec` (600 s) |
+| step 1 (t≈15 min) | decommission issued for broker 1 (or broker 0 — autobalancer drains one at a time) → enters `draining` |
+| step 1 → step 4   | drain stalled; status flips to `"stalled"` because RF=5 has nowhere to rebuild replicas |
+| step 4 done       | brokers 5, 6 join; 5 reachable brokers → autobalancer status flips back to `"ready"` |
+| step 5 onward     | drain resumes on broker 1, completes, broker 1 evicted; decom issued for broker 0; same cycle |
 
 ```bash
 for i in $(seq 1 30); do
@@ -818,7 +834,7 @@ cd <aws|gcp|azure>/terraform-failover && terraform destroy
 # (or `gcloud container clusters delete rp-failover --region us-central1` if you used the manual path)
 ```
 
-Brokers 5 and 6 become unreachable as their pods + nodes go away; after `partition_autobalancing_node_availability_timeout_sec` (30 s) the controller marks them unavailable, and after `partition_autobalancing_node_autodecommission_timeout_sec` (60 s) the partition autobalancer issues the decommission. **This works now because the cluster has 5 reachable brokers** (the 2 new us-east1 + 1 us-east4 + 2 us-west1) so RF=5 re-replication is possible — the same precondition that step 3's capacity injection unblocked. Watch the eviction:
+Brokers 5 and 6 become unreachable as their pods + nodes go away; after `partition_autobalancing_node_availability_timeout_sec` (10 min) the controller marks them unavailable, and after `partition_autobalancing_node_autodecommission_timeout_sec` (15 min) the partition autobalancer issues the decommission. **This works now because the cluster has 5 reachable brokers** (the 2 new us-east1 + 1 us-east4 + 2 us-west1) so RF=5 re-replication is possible — the same precondition that step 3's capacity injection unblocked. Watch the eviction:
 
 ```bash
 for i in $(seq 1 10); do
@@ -847,7 +863,7 @@ You can fall back to **manual decommission** (`rpk redpanda admin brokers decomm
 
 - **Auto-decom requires the autobalancer to have a healthy view of the cluster.** With `RF=N` (where N is the broker count), losing any broker leaves no spare capacity — the autobalancer can't move replicas off a "ghost" broker because there's nowhere for them to land. The capacity-injection step is *required*; you cannot get back to `Healthy: true` without it. If you choose `RF < broker count` (e.g. `RF=3` over a 5-broker cluster) the autobalancer will self-heal a single broker loss without intervention.
 - **The operator reverts cluster config from the StretchCluster spec on every reconcile.** Any `rpk cluster config set` against keys that are also in `spec.config.cluster` will be undone on the next reconcile pass. If you want a different timeout for a one-off demo, edit `<cloud>/manifests/stretchcluster.yaml` and re-apply rather than setting it via rpk.
-- **Cross-region heartbeats and the hardcoded 100 ms `node_status_rpc` timeout.** Inter-continental region pairs (e.g. `europe-west1 ↔ us-east1`, RTT ~100 ms) will *appear* unavailable to the controller during heartbeat hiccups, which can trigger an unwanted decommission cascade. Pick region triples whose worst-case pairwise RTT stays under ~70 ms (see [Cost (running)](#cost-running) for a GCP example using `us-east1 / us-west1 / us-east4`).
+- **Cross-region heartbeats and the hardcoded 100 ms `node_status_rpc` timeout.** Inter-continental region pairs (e.g. `eu-west-1 ↔ us-west-2`, RTT ~140 ms) will *appear* unavailable to the controller during heartbeat hiccups, which makes the partition balancer's `unavailable_nodes` set wrong (you'll see a healthy broker listed as unavailable while a truly-down broker is missing). This is what trips Demo B on AWS and forces the manual controller-leadership-transfer workaround documented at the start of this section. Pick region triples whose worst-case pairwise RTT stays under ~100 ms (the GCP triple `us-east1` / `us-west1` / `us-east4` stays under ~70 ms and runs Demo B cleanly).
 
 After the demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replicated partitions) and that the `multicluster.peers`/raft layer is intact via `rpk k8s multicluster status`.
 
