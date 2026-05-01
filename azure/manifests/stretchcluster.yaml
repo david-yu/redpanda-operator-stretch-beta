@@ -37,17 +37,21 @@ spec:
   # defaults are 900s / 600s) so a transient outage doesn't trigger a decommission.
   config:
     cluster:
-      # Ordered leader pinning. The leader balancer places partition leaders in
-      # the FIRST listed rack with available brokers; if every broker in that
-      # rack is unreachable, it falls through to the next rack, and so on.
-      # The failover region (eastus2 by default in azure/terraform-failover) is
-      # listed second so that if the primary rack (eastus) is unavailable, the
-      # controller migrates to a low-RTT fallback rack first.
-      default_leaders_preference: "racks:eastus,eastus2,westus2,centralus"
+      # Constrains partition leaders to brokers in the listed rack(s). When
+      # multiple racks are listed Redpanda distributes leaders equally across
+      # them — there is NO ordered/priority fallback. So a single-rack value
+      # is what actually pins leaders to one region; multi-rack values just
+      # restrict the eligible set. Cluster-property docs:
+      # https://docs.redpanda.com/current/reference/properties/cluster-properties/
+      default_leaders_preference: "racks:eastus"
       # Time a broker can be unreachable before it's marked unavailable for
-      # partition movement. Demo value (default: 900). Raise for production.
-      partition_autobalancing_node_availability_timeout_sec: 30
+      # partition movement. 10 min so Demo A's "scale region to 0 → restore"
+      # cycle finishes before the autobalancer marks the brokers unavailable.
+      # Default: 900s. Raise further for production.
+      partition_autobalancing_node_availability_timeout_sec: 600
       # Time a broker can stay unavailable before the autobalancer issues a
-      # decommission for it. Must be > the availability timeout above. Demo
-      # value (default: 600). Raise for production.
-      partition_autobalancing_node_autodecommission_timeout_sec: 60
+      # decommission for it. Must be > the availability timeout above. Demo B
+      # observes the autodecom kicking in once a broker stays unavailable past
+      # this threshold; expect to wait ~15 min into Demo B for the
+      # `MEMBERSHIP=draining` state to appear. Default: 600s.
+      partition_autobalancing_node_autodecommission_timeout_sec: 900
