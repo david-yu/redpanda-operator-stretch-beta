@@ -853,55 +853,77 @@ After the demo, confirm the cluster is healthy (`Healthy=True`, `0` under-replic
 
 ## Tear down
 
-Workload first (StretchCluster has a deletion finalizer that needs every cluster reachable), then helm releases, then `terraform destroy` for the infrastructure:
+Each cloud has a teardown script under `<cloud>/scripts/teardown.sh` that wraps the right ordering and the post-destroy cleanup that a naive `terraform destroy` misses (CR finalizer hangs, orphan LBs / security groups / ENIs, kubernetes-provider timeouts after the API server is gone). Run the one that matches the stack you brought up:
 
 ```bash
-# 1. Delete StretchCluster on every cluster.
+# AWS — main stack
+./aws/scripts/teardown.sh
+
+# AWS — main stack + aws/terraform-failover
+./aws/scripts/teardown.sh --with-failover
+
+# GCP (project_id required, must match the one you applied with)
+./gcp/scripts/teardown.sh --project <your-gcp-project>
+./gcp/scripts/teardown.sh --project <your-gcp-project> --with-failover
+
+# Azure
+./azure/scripts/teardown.sh
+./azure/scripts/teardown.sh --with-failover
+```
+
+Each script is idempotent — safe to re-run after a partial failure — and goes through the same ordering:
+
+1. **Delete peer Services first** so the cloud's load-balancer controller (AWS LBC, AKS cloud-controller-manager) can clean up its NLB / internal LB while still running.
+2. **Patch finalizers off `NodePool` / `StretchCluster` CRs** so the namespace can finalize after the operator helm release is gone (the operator owns those finalizers; without it, they'd block forever).
+3. **Helm-uninstall the operator, cert-manager, and (AWS) the LBC.**
+4. **Force-strip the namespace finalizer** via the `/finalize` subresource if it's still stuck `Terminating`.
+5. **`terraform state rm` the `kubernetes_*` and `helm_release.*` resources** before destroying the cluster — otherwise the kubernetes / helm providers keep retrying against the about-to-be-destroyed API server and `terraform destroy` dies with `context deadline exceeded`.
+6. **`terraform destroy`** the failover stack (if `--with-failover`) and then the main stack.
+7. **Cloud-specific orphan sweep** (AWS: NLBs, `k8s-*` SGs, available ENIs; Azure: internal LBs in `MC_*` resource groups; GCP: typically nothing).
+8. **Final `terraform destroy` pass** to pick up VPCs/RGs that the orphan sweep just unblocked.
+9. **Clean up `rp-*` kubectl contexts, clusters, and users** so the next `terraform apply` can register fresh ones (the rename step fails with "context already exists" otherwise).
+
+Manual fallback — if you want to do it by hand without the script (or to debug a stuck step), the same ordering applies. The minimum viable flow is:
+
+```bash
+# 1. Strip CR finalizers so the namespace can finalize once the operator is gone.
 for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" -n redpanda delete stretchcluster redpanda --wait=false
-done
-for C in rp-east rp-west rp-eu; do
-  kubectl --context "$C" -n redpanda wait --for=delete stretchcluster/redpanda --timeout=10m
+  for R in $(kubectl --context $C -n redpanda get nodepool,stretchcluster -o name 2>/dev/null); do
+    kubectl --context $C -n redpanda patch "$R" --type=merge -p '{"metadata":{"finalizers":[]}}'
+  done
 done
 
-# 2. Uninstall the operator + cert-manager helm releases.
+# 2. Uninstall helm releases.
 for C in rp-east rp-west rp-eu; do
-  helm --kube-context "$C" uninstall "$C" -n redpanda
-  helm --kube-context "$C" uninstall cert-manager -n cert-manager
+  helm --kube-context $C uninstall $C -n redpanda
+  helm --kube-context $C uninstall cert-manager -n cert-manager
 done
 
-# 3. Tear down infrastructure with Terraform.
+# 3. Drop kubernetes_* / helm_release.* from TF state, then destroy.
 cd <aws|gcp|azure>/terraform
+terraform state list | grep -E '^(kubernetes_|helm_release\.)' | xargs -r -n1 terraform state rm
 terraform destroy
 # (GCP: terraform destroy -var project_id=<your-gcp-project>)
 
-# 4. Remove the now-stale kubectl contexts/clusters/users from your local kubeconfig.
-#    Skip this and the next `terraform apply` will fail to register fresh
-#    contexts with "the context 'rp-east' already exists" (the rename step
-#    in `kubectl_setup_commands` errors when the alias is taken).
-#
-#    Note: `kubectl config rename-context` only renames the *context*; the
-#    underlying cluster + user records keep the cloud's full name (GCP
-#    `gke_<project>_<region>_rp-east`, AWS `arn:aws:eks:...:cluster/rp-east`,
-#    Azure `rp-east`). Match by name suffix to catch all three.
-for C in rp-east rp-west rp-eu; do
-  kubectl config delete-context "$C" 2>/dev/null || true
+# 4. Remove rp-* kubectl entries so the next `terraform apply` can re-register
+#    the contexts cleanly. Match cluster + user by suffix because the cloud
+#    keys them by full ARN / GKE name / AKS name, not the rename alias.
+for C in rp-east rp-west rp-eu; do kubectl config delete-context $C 2>/dev/null; done
+for N in $(kubectl config view -o jsonpath='{.clusters[*].name}' | tr ' ' '\n' | grep -E 'rp-(east|west|eu)$'); do
+  kubectl config delete-cluster "$N" 2>/dev/null
 done
-for NAME in $(kubectl config view -o jsonpath='{.clusters[*].name}' | tr ' ' '\n' | grep -E 'rp-(east|west|eu)$'); do
-  kubectl config delete-cluster "$NAME" 2>/dev/null || true
-done
-for NAME in $(kubectl config view -o jsonpath='{.users[*].name}' | tr ' ' '\n' | grep -E 'rp-(east|west|eu)$'); do
-  kubectl config delete-user "$NAME" 2>/dev/null || true
+for N in $(kubectl config view -o jsonpath='{.users[*].name}' | tr ' ' '\n' | grep -E 'rp-(east|west|eu)$'); do
+  kubectl config delete-user "$N" 2>/dev/null
 done
 ```
 
-Cloud-specific notes:
+Cloud-specific notes (the script handles all of these — read these only if you're debugging a hang):
 
-- **AWS**: `terraform destroy` removes EKS clusters, VPCs, TGWs and peerings, NSG rules, AWS LBC IRSA, and the IAM policy. If destroy hangs on a TGW peering attachment, give it 2–3 minutes — peering deletion is async on the AWS side and Terraform retries. If a destroy hangs on a VPC, an unmanaged ENI from a leftover NLB is usually the cause; check the AWS console for stranded ELBv2 resources tagged with the project name.
-- **GCP**: `terraform destroy` removes GKE clusters, the global VPC, regional subnets, Cloud NAT/Router, and firewall rules. Destroy is generally clean.
-- **Azure**: `terraform destroy` removes AKS, VNets, peerings, NSGs, and resource groups. If a resource group destroy hangs, check the Azure portal for orphan internal LBs that the AKS cloud-controller-manager didn't clean up before AKS itself was deleted (rare but possible — usually `terraform destroy` retries through it).
+- **AWS**: when the AWS LBC is uninstalled before its peer Service is deleted, the LBC can't drop the NLB it manages. The orphan NLB and the `k8s-redpanda-*` / `k8s-traffic-*` security groups it created reference the node SG, so the VPC delete fails. The teardown script deletes peer Services first, waits ~90 s for the LBC to drain its NLBs, and post-destroy sweeps any stragglers. If you destroyed manually and your VPC won't delete, check the AWS console for ELBv2s and security groups starting with `k8s-`.
+- **GCP**: destroy is usually clean — the GKE integration cleans up its own forwarding rules, target pools, and firewall rules without help. The script just handles the universal CR-finalizer / TF-provider-timeout cases.
+- **Azure**: AKS provisions VNets and Standard LBs in an AKS-managed `MC_<rg>_<cluster>_<region>` resource group separate from the one Terraform manages. If the AKS cloud-controller-manager doesn't drop its internal LB before AKS itself is deleted, the LB strands in `MC_*` and blocks RG cleanup. The script sweeps `MC_*` LBs post-destroy. If destroy hits an `Unexpected Identity Change` error on a `kubernetes_service` resource (a kubernetes-provider quirk we hit during validation), the script catches that and retries after a `terraform state rm`.
 
-In all three clouds, the recommended belt-and-braces sanity check after destroy is to look for any resources tagged with `Project=redpanda-stretch-validation` (or the value of `var.project_name`) and confirm none are left behind.
+Belt-and-braces sanity check after destroy: list anything tagged with `Project=redpanda-stretch-validation` (or the value of `var.project_name`) and confirm none are left behind.
 
 ## Troubleshooting
 
