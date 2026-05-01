@@ -13,7 +13,13 @@ resource "azurerm_kubernetes_cluster" "east" {
   default_node_pool {
     name            = "default"
     node_count      = var.node_count
-    vm_size         = var.vm_size
+    # rp-east in eastus uses the DASv5 family because the DSv5 quota in
+    # eastus is commonly already partially consumed (e.g. by a previous
+    # terraform apply that left orphan resources, or by other workloads
+    # in the same subscription) — DASv5 has an independent 10-vCPU quota
+    # that's typically untouched. Functionally identical for our use:
+    # 4-vCPU AMD-based variant of D-series, same Premium SSD support.
+    vm_size         = "Standard_D4ads_v5"
     os_disk_size_gb = var.node_disk_size_gb
     vnet_subnet_id  = azurerm_subnet.east_nodes.id
     type            = "VirtualMachineScaleSets"
