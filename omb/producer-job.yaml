@@ -1,0 +1,95 @@
+# OMB-equivalent producer load generator. Drives ~10 Mbps of writes
+# (1280 msg/s × 1024 bytes ≈ 1.31 MB/s) at the StretchCluster from
+# inside the redpanda namespace. See omb/README.md for context.
+#
+# Connects via the local cluster's headless `redpanda` Service over
+# TLS, trusting the operator-issued CA (mounted via the same Secret
+# the brokers use, `redpanda-default-cert`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: omb-producer
+  namespace: redpanda
+spec:
+  # Don't auto-stop after the records are produced — the perf script
+  # exits when --num-records is hit, so we set it high enough to span
+  # any plausible demo (15 minutes of buffer at the demo timeouts is
+  # plenty); when it does exit, we let the Job stay Completed so logs
+  # are inspectable.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: tls
+          secret:
+            secretName: redpanda-default-cert
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: producer-config
+          configMap:
+            name: omb-producer-config
+      containers:
+        - name: producer
+          image: apache/kafka:3.8.0
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tls/redpanda
+              readOnly: true
+            - name: producer-config
+              mountPath: /etc/kafka/producer.properties
+              subPath: producer.properties
+              readOnly: true
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              # Wait for the bootstrap to resolve. On a freshly-created
+              # cluster the headless Service can take 10-30 s before any
+              # broker is Ready; we don't want the Job to crashloop on
+              # transient DNS failures.
+              for i in $(seq 1 30); do
+                getent hosts redpanda.redpanda.svc.cluster.local && break
+                sleep 2
+              done
+              exec /opt/kafka/bin/kafka-producer-perf-test.sh \
+                --topic load-test \
+                --num-records 100000000 \
+                --record-size 1024 \
+                --throughput 1280 \
+                --producer.config /etc/kafka/producer.properties \
+                --print-metrics
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omb-producer-config
+  namespace: redpanda
+data:
+  producer.properties: |
+    bootstrap.servers=redpanda.redpanda.svc.cluster.local:9093
+    security.protocol=SSL
+    ssl.truststore.type=PEM
+    ssl.truststore.location=/etc/tls/redpanda/ca.crt
+    ssl.endpoint.identification.algorithm=
+    # acks=all so the producer doesn't ack until every in-sync replica has
+    # the record — this is what makes a regional failure visible: the
+    # producer will block for up to its delivery.timeout.ms when leaders
+    # are unreachable, instead of silently dropping records.
+    acks=all
+    linger.ms=5
+    batch.size=131072
+    compression.type=lz4
+    delivery.timeout.ms=120000
+    request.timeout.ms=30000
+    max.in.flight.requests.per.connection=5
+    enable.idempotence=true
