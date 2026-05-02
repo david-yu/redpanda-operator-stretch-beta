@@ -624,6 +624,12 @@ done
 kubectl --context rp-east -n redpanda delete pod redpanda-rp-east-0 redpanda-rp-east-1 --grace-period=10
 ```
 
+Or use the wrapper script which does the same plus a cluster-health snapshot before/after:
+
+```bash
+./omb/run-demo.sh demo-b-fail
+```
+
 > **AWS-only: cluster-view corruption while only rp-east is down (steps 1–3).** With brokers 0+1 down, controller raft re-elects somewhere — and there's a non-trivial chance it lands on broker 2 (`eu-west-1`). The ~140 ms RTT to `us-west-2` exceeds Redpanda's hardcoded 100 ms `node_status_rpc` timeout, so the controller silently marks brokers 3+4 (`us-west-2`) as `IS-ALIVE=false` and `partition_balancer/status` reports the wrong `unavailable_nodes` set (you'll see `[2]` or similar instead of `[0, 1]`). Check `curl https://localhost:9644/v1/partitions/redpanda/controller/0` from any reachable broker; if `leader_id` is `2`, transfer it. **In our validation, transferring to us-west-2 didn't fix things** — once the controller is in us-west-2 it can't heartbeat eu-west-1, so the same corruption shows up inverted (`unavailable_nodes: [2]`). The clean fix only emerges after step 4 brings up rp-failover in us-east-2; transferring the controller there restores a coherent cluster view because us-east-2 sits within 100 ms of every surviving region. Until then, expect noisy snapshots — keep going to step 4 rather than chasing the wrong-`unavailable_nodes` value.
 >
 > GCP's `us-east1`/`us-west1`/`us-east4` triple stays under 100 ms RTT pairwise, and Azure's `eastus`/`westus2`/`centralus` does too — neither cloud needed any controller transfer in our validation.
