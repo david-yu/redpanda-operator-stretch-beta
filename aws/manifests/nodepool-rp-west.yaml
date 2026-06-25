@@ -1,5 +1,9 @@
+# operator v26.2.1-beta.2: NodePool was renamed to RedpandaBrokerPool, and the
+# per-broker concerns rackAwareness / rbac / tls / external moved here from
+# StretchCluster. clusterRef.kind must be set to StretchCluster (it defaults to
+# "Redpanda" otherwise). Filename kept as nodepool-* for continuity with the README.
 apiVersion: cluster.redpanda.com/v1alpha2
-kind: NodePool
+kind: RedpandaBrokerPool
 metadata:
   name: rp-west
   namespace: redpanda
@@ -12,7 +16,19 @@ spec:
   image:
     repository: redpandadata/redpanda
     tag: v26.1.6
+  rbac:
+    enabled: true
+  external:
+    enabled: false
+  rackAwareness:
+    enabled: true
+    nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region
+  tls:
+    enabled: true
+    certs:
+      default:
+        caEnabled: true
   services:
     perPod:
       remote:
-        enabled: true
+        enabled: true                   # render per-pool Services for remote pools too

@@ -1,0 +1,35 @@
+# Demo B failover capacity (operator v26.2.1-beta.2 API). RedpandaBrokerPool that
+# replaced NodePool; per-broker rbac/external/rackAwareness/tls live here, not on
+# StretchCluster. Two brokers in the failover region (us-central1) injected while a
+# primary region is down so RF=5 re-replication can unblock. clusterRef.kind must be
+# StretchCluster (defaults to "Redpanda").
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: RedpandaBrokerPool
+metadata:
+  name: rp-failover
+  namespace: redpanda
+spec:
+  clusterRef:
+    group: cluster.redpanda.com
+    kind: StretchCluster
+    name: redpanda
+  replicas: 2
+  image:
+    repository: redpandadata/redpanda
+    tag: v26.1.6
+  rbac:
+    enabled: true
+  external:
+    enabled: false
+  rackAwareness:
+    enabled: true
+    nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region (us-central1)
+  tls:
+    enabled: true
+    certs:
+      default:
+        caEnabled: true
+  services:
+    perPod:
+      remote:
+        enabled: true
