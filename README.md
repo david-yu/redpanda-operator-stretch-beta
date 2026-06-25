@@ -1,6 +1,6 @@
-# Redpanda Operator v26.2.1-beta.1 — Stretch Cluster on AWS, GCP, or Azure
+# Redpanda Operator v26.2.1-beta.2 — Stretch Cluster on AWS, GCP, or Azure
 
-A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.1`. Most recently validated on AWS, GCP, and Azure — see the [validation matrix](#validation-matrix) just before [Prerequisites](#prerequisites) for the region triples used and per-cloud demo outcomes.
+A working, end-to-end deployment of a 3-region Redpanda **StretchCluster** managed by `operator/v26.2.1-beta.2`. Most recently validated on AWS, GCP, and Azure — see the [validation matrix](#validation-matrix) just before [Prerequisites](#prerequisites) for the region triples used and per-cloud demo outcomes.
 
 This repo captures the exact configs that brought a stretch cluster up green on first boot, plus the gotchas that aren't in the reference doc. The `aws/`, `gcp/`, and `azure/` directories each bundle the terraform, manifests, and helm-values that actually work for that cloud — see [Troubleshooting](#troubleshooting) for the why behind each one.
 
@@ -16,7 +16,7 @@ This repo captures the exact configs that brought a stretch cluster up green on 
   - [3. Bootstrap multicluster TLS + kubeconfig secrets](#3-bootstrap-multicluster-tls--kubeconfig-secrets)
   - [4. License Secret + helm install](#4-license-secret--helm-install)
   - [5. Install cert-manager per cluster](#5-install-cert-manager-per-cluster)
-  - [6. Apply StretchCluster + NodePools](#6-apply-stretchcluster--nodepools)
+  - [6. Apply StretchCluster + RedpandaBrokerPools](#6-apply-stretchcluster--redpandabrokerpools)
   - [7. Wait for StretchCluster status conditions to go green](#7-wait-for-stretchcluster-status-conditions-to-go-green)
   - [8. Validate stretch cluster health using rpk k8s multicluster](#8-validate-stretch-cluster-health-using-rpk-k8s-multicluster)
   - [9. Quick test — produce and consume across clusters](#9-quick-test--produce-and-consume-across-clusters)
@@ -32,15 +32,15 @@ This repo captures the exact configs that brought a stretch cluster up green on 
 ```
 aws/
   terraform/    — VPCs, EKS, Transit Gateway peering, AWS LB Controller, peer LB Services
-  manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for AWS regions)
+  manifests/    — stretchcluster.yaml + nodepool-*.yaml (leader preference baked for AWS regions)
   helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
 gcp/
   terraform/    — Single global VPC + 3 regional subnets, GKE, firewall rules, peer LB Services
-  manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for GCP regions)
+  manifests/    — stretchcluster.yaml + nodepool-*.yaml (leader preference baked for GCP regions)
   helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
 azure/
   terraform/    — VNets, AKS, full-mesh VNet peering, NSGs, peer LB Services
-  manifests/    — stretchcluster.yaml + nodepool-*.yaml (rack preference baked for Azure regions)
+  manifests/    — stretchcluster.yaml + nodepool-*.yaml (leader preference baked for Azure regions)
   helm-values/  — values-*.example.yaml; fill in <PLACEHOLDER>s before use
 omb/             — cloud-agnostic 10 Mbps continuous-load Jobs that run alongside Demo A / B
                   (kafka-producer-perf-test + kafka-consumer-perf-test in the redpanda namespace,
@@ -48,7 +48,7 @@ omb/             — cloud-agnostic 10 Mbps continuous-load Jobs that run alongs
                   health + producer throughput) — see omb/README.md
 ```
 
-Each top-level cloud directory is self-contained — pick one cloud and run the full flow (terraform → bootstrap → helm install → manifests) from inside it. The nodepool manifests are cloud-agnostic; the only cloud-specific manifest difference is the `default_leaders_preference` rack list in `stretchcluster.yaml`, which uses the GKE/EKS/AKS-specific `topology.kubernetes.io/region` label values for that cloud.
+Each top-level cloud directory is self-contained — pick one cloud and run the full flow (terraform → bootstrap → helm install → manifests) from inside it. The `nodepool-*.yaml` (`RedpandaBrokerPool`) manifests are cloud-agnostic; the only cloud-specific manifest difference is the `default_leaders_preference` rack list in `stretchcluster.yaml`, which uses the GKE/EKS/AKS-specific `topology.kubernetes.io/region` label values for that cloud.
 
 ## Architecture
 
@@ -64,7 +64,7 @@ Two transports:
 
 ### Broker layout: 2 / 2 / 1 with RF=5
 
-Each NodePool sets a per-region broker count: `nodepool-rp-east.yaml` and `nodepool-rp-west.yaml` use `replicas: 2`, `nodepool-rp-eu.yaml` uses `replicas: 1` — five brokers total, deployed `2 / 2 / 1` across the three regions. The default replication factor for new topics is `5` (one replica per broker), and the controller raft also includes all five brokers, so both data and control-plane raft groups need a 3-of-5 majority to make progress.
+Each RedpandaBrokerPool sets a per-region broker count: `nodepool-rp-east.yaml` and `nodepool-rp-west.yaml` use `replicas: 2`, `nodepool-rp-eu.yaml` uses `replicas: 1` — five brokers total, deployed `2 / 2 / 1` across the three regions. The default replication factor for new topics is `5` (one replica per broker), and the controller raft also includes all five brokers, so both data and control-plane raft groups need a 3-of-5 majority to make progress.
 
 The asymmetric `2 / 2 / 1` shape — instead of `2 / 2 / 2` or `1 / 1 / 1` — is the cheapest layout that survives **any single full-region outage** without losing quorum:
 
@@ -92,14 +92,14 @@ The continuous-load harness lives at [`omb/`](omb/) and runs as a pair of K8s Jo
 
 ## Prerequisites
 
-| Tool | Min version |
-|---|---|
-| Cloud CLI for your provider — `aws` / `gcloud` / `az` | latest stable |
-| `terraform` | ≥ 1.6 |
-| `kubectl` | matches your K8s version (1.31 here) |
-| `helm` | ≥ 3.14 |
-| `rpk` | base CLI; the v26.2.1-beta.1 `rpk-k8s` plugin is installed in step 2 |
-| GCP only: `gke-gcloud-auth-plugin` | latest |
+| Tool | Min version                                                          |
+|---|----------------------------------------------------------------------|
+| Cloud CLI for your provider — `aws` / `gcloud` / `az` | latest stable                                                        |
+| `terraform` | ≥ 1.6                                                                |
+| `kubectl` | matches your K8s version (1.31 here)                                 |
+| `helm` | ≥ 3.14                                                               |
+| `rpk` | base CLI; the v26.2.1-beta.2 `rpk-k8s` plugin is installed in step 2 |
+| GCP only: `gke-gcloud-auth-plugin` | latest                                                               |
 
 Plus a **Redpanda Enterprise license** — required, not optional. The multicluster operator binary won't start without one (see [Troubleshooting](#troubleshooting) issue 1).
 
@@ -149,12 +149,12 @@ terraform output -raw kubectl_setup_commands   # for reference
 
 ### 2. Install the `rpk-k8s` plugin
 
-The multicluster bootstrap, status, and config are driven by `rpk k8s multicluster`, which lives in a versioned plugin shipped alongside each operator release. Install the plugin matching the operator version (`v26.2.1-beta.1`):
+The multicluster bootstrap, status, and config are driven by `rpk k8s multicluster`, which lives in a versioned plugin shipped alongside each operator release. Install the plugin matching the operator version (`v26.2.1-beta.2`):
 
 ```bash
 ARCH=darwin-arm64   # or linux-amd64, etc.
-curl -sSLO "https://github.com/redpanda-data/redpanda-operator/releases/download/operator/v26.2.1-beta.1/rpk-k8s-${ARCH}-v26.2.1-beta.1.tar.gz"
-tar -xzf "rpk-k8s-${ARCH}-v26.2.1-beta.1.tar.gz"
+curl -sSLO "https://github.com/redpanda-data/redpanda-operator/releases/download/operator/v26.2.1-beta.2/rpk-k8s-${ARCH}-v26.2.1-beta.2.tar.gz"
+tar -xzf "rpk-k8s-${ARCH}-v26.2.1-beta.2.tar.gz"
 mkdir -p "$HOME/.local/bin"
 install "rpk-k8s-${ARCH}" "$HOME/.local/bin/.rpk.ac-k8s"
 export PATH="$HOME/.local/bin:$PATH"
@@ -210,7 +210,7 @@ for C in rp-east rp-west rp-eu; do
   helm --kube-context "$C" upgrade --install \
     "$C" redpanda/operator \
     --namespace redpanda \
-    --version 26.2.1-beta.1 --devel \
+    --version 26.2.1-beta.2 --devel \
     -f /tmp/values-${C}.yaml \
     --wait --timeout 5m &
 done
@@ -244,11 +244,11 @@ done
 wait
 ```
 
-### 6. Apply StretchCluster + NodePools
+### 6. Apply StretchCluster + RedpandaBrokerPools
 
 (Terraform already annotates the default StorageClass on AWS — `gp2`. GKE and AKS ship a default already; no patch needed.)
 
-The repo ships one `stretchcluster.yaml` and three `nodepool-rp-{east,west,eu}.yaml` per cloud. The StretchCluster CR is identical across the three K8s clusters (it's the cluster-wide Redpanda spec); each NodePool defines that cluster's slice of the broker fleet — `replicas: 2` for rp-east and rp-west, `replicas: 1` for rp-eu (the 2 / 2 / 1 quorum-tiebreaker shape — see [Broker layout](#broker-layout-2--2--1-with-rf5)).
+The repo ships one `stretchcluster.yaml` and three `nodepool-rp-{east,west,eu}.yaml` per cloud. The StretchCluster CR is identical across the three K8s clusters (it's the cluster-wide Redpanda spec); each RedpandaBrokerPool defines that cluster's slice of the broker fleet — `replicas: 2` for rp-east and rp-west, `replicas: 1` for rp-eu (the 2 / 2 / 1 quorum-tiebreaker shape — see [Broker layout](#broker-layout-2--2--1-with-rf5)).
 
 **`<cloud>/manifests/stretchcluster.yaml`** (GCP example shown — AWS/Azure differ only in the `default_leaders_preference` rack list):
 
@@ -259,20 +259,11 @@ metadata:
   name: redpanda
   namespace: redpanda
 spec:
-  rbac:
-    enabled: true
-  external:
-    enabled: false
+  # operator v26.2.1-beta.2: the per-broker fields rbac / external / rackAwareness / tls
+  # are NOT on StretchCluster anymore — they live on each RedpandaBrokerPool (below).
+  # StretchCluster now carries only the cluster-wide networking / enterprise / config.
   networking:
     crossClusterMode: flat              # operator manages headless Services + EndpointSlices
-  rackAwareness:
-    enabled: true
-    nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region
-  tls:
-    enabled: true
-    certs:
-      default:
-        caEnabled: true
   enterprise:
     licenseSecretRef:
       name: redpanda-license
@@ -289,23 +280,36 @@ spec:
       partition_autobalancing_node_autodecommission_timeout_sec: 900   # 15 min — Demo B observation window
 ```
 
-**`<cloud>/manifests/nodepool-rp-east.yaml`** (rp-west uses an identical shape with `name: rp-west`; rp-eu uses `replicas: 1`):
+**`<cloud>/manifests/nodepool-rp-east.yaml`** (filename kept as `nodepool-*` for continuity; the kind is now `RedpandaBrokerPool`. rp-west uses an identical shape with `name: rp-west`; rp-eu uses `replicas: 1`):
 
 ```yaml
 apiVersion: cluster.redpanda.com/v1alpha2
-kind: NodePool
+kind: RedpandaBrokerPool                # operator v26.2.1-beta.2 renamed RedpandaBrokerPool → RedpandaBrokerPool
 metadata:
   name: rp-east
   namespace: redpanda
 spec:
   clusterRef:
     group: cluster.redpanda.com
-    kind: StretchCluster
+    kind: StretchCluster                # must be set explicitly; clusterRef.kind defaults to "Redpanda"
     name: redpanda
   replicas: 2                           # rp-eu uses replicas: 1 (the tiebreaker)
   image:
     repository: redpandadata/redpanda
     tag: v26.1.6
+  # Per-broker concerns that moved here from StretchCluster in beta.2:
+  rbac:
+    enabled: true
+  external:
+    enabled: false
+  rackAwareness:
+    enabled: true
+    nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region
+  tls:
+    enabled: true
+    certs:
+      default:
+        caEnabled: true
   services:
     perPod:
       remote:
@@ -320,7 +324,7 @@ for C in rp-east rp-west rp-eu; do
 done
 ```
 
-Apply each NodePool to its own cluster:
+Apply each RedpandaBrokerPool to its own cluster:
 
 ```bash
 kubectl --context rp-east -n redpanda apply -f <cloud>/manifests/nodepool-rp-east.yaml
@@ -328,7 +332,7 @@ kubectl --context rp-west -n redpanda apply -f <cloud>/manifests/nodepool-rp-wes
 kubectl --context rp-eu   -n redpanda apply -f <cloud>/manifests/nodepool-rp-eu.yaml
 ```
 
-The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each NodePool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). See [Troubleshooting](#troubleshooting) issues 6–7 for the why behind each.
+The StretchCluster spec uses **`networking.crossClusterMode: flat`** (operator manages headless Services + EndpointSlices with peer pod IPs — appropriate when the cloud gives you direct pod-to-pod routability across regions, which all three providers do here), and each RedpandaBrokerPool has **`services.perPod.remote.enabled: true`** (so per-pool Services get rendered for remote pools too — required so peer DNS lookups resolve). See [Troubleshooting](#troubleshooting) issues 6–7 for the why behind each.
 
 ### 7. Wait for StretchCluster status conditions to go green
 
@@ -433,13 +437,15 @@ Run both demos after step 9 (Quick test) on a healthy cluster.
 
 ### Demo A: leader pinning + region-failure fallthrough
 
-The committed `<cloud>/manifests/stretchcluster.yaml` configures rack-aware leader pinning with an ordered failover list — primary region first, then the failover region used by `<cloud>/terraform-failover/`, then the remaining regions:
+Rack-aware leader pinning is split across two CRs in the beta.2 API: rack awareness is set per broker pool in `<cloud>/manifests/nodepool-rp-*.yaml` (`RedpandaBrokerPool`), while the ordered leader-preference list — primary region first, then the failover region used by `<cloud>/terraform-failover/`, then the remaining regions — is the cluster-wide `config` on `<cloud>/manifests/stretchcluster.yaml`:
 
 ```yaml
+# RedpandaBrokerPool (<cloud>/manifests/nodepool-rp-*.yaml) — rack awareness is per-pool:
 rackAwareness:
   enabled: true
   nodeAnnotation: topology.kubernetes.io/region   # rack = cloud region
 
+# StretchCluster (<cloud>/manifests/stretchcluster.yaml) — leader preference is cluster-wide:
 config:
   cluster:
     # Ordered preference. Leaders sit in the first reachable rack and fall
@@ -536,7 +542,7 @@ kubectl --context rp-east -n redpanda exec sts/redpanda-rp-east -c redpanda -- \
 
 **Step 3 — simulate the preferred region failing**
 
-`kubectl scale sts redpanda-rp-east --replicas=0` does **not** work for this — the operator on every peer cluster reconciles the rp-east `NodePool` cross-cluster (via the kubeconfig secrets bootstrapped in step 3) and brings the StatefulSet back up within ~60 s. Likewise, patching the `NodePool` to `replicas: 0` triggers a *graceful* decommission, which stalls under RF=5 (the autobalancer has nowhere to land replicas) — so the brokers also stay up, just in a `condemned` state.
+`kubectl scale sts redpanda-rp-east --replicas=0` does **not** work for this — the operator on every peer cluster reconciles the rp-east `RedpandaBrokerPool` cross-cluster (via the kubeconfig secrets bootstrapped in step 3) and brings the StatefulSet back up within ~60 s. Likewise, patching the `RedpandaBrokerPool` to `replicas: 0` triggers a *graceful* decommission, which stalls under RF=5 (the autobalancer has nowhere to land replicas) — so the brokers also stay up, just in a `condemned` state.
 
 To simulate a true regional outage (brokers unreachable, no graceful drain), cordon every node in the rp-east K8s cluster and delete the broker pods. The operator can keep `replicas: 2` on the StatefulSet, but with all nodes cordoned the new pods sit `Pending`:
 
@@ -728,7 +734,7 @@ cp <cloud>/helm-values/values-rp-east.example.yaml /tmp/values-rp-failover.yaml
 #    /tmp/values-rp-{east,west,eu}.yaml → add the rp-failover peer entry, then:
 for C in rp-east rp-west rp-eu; do
   helm --kube-context "$C" upgrade "$C" redpanda/operator \
-    --namespace redpanda --version 26.2.1-beta.1 --devel \
+    --namespace redpanda --version 26.2.1-beta.2 --devel \
     -f /tmp/values-${C}.yaml --wait --timeout 5m
 done
 
@@ -742,19 +748,23 @@ helm --kube-context rp-failover upgrade --install cert-manager jetstack/cert-man
   --set crds.enabled=true --wait --timeout 5m
 
 helm --kube-context rp-failover upgrade --install rp-failover redpanda/operator \
-  --namespace redpanda --version 26.2.1-beta.1 --devel \
+  --namespace redpanda --version 26.2.1-beta.2 --devel \
   -f /tmp/values-rp-failover.yaml --wait --timeout 5m
 
-# 5. StretchCluster + a 2-broker NodePool on the failover cluster (use your cloud's manifests/)
+# 5. StretchCluster + a 2-broker RedpandaBrokerPool on the failover cluster (use your cloud's manifests/)
 kubectl --context rp-failover -n redpanda apply -f <cloud>/manifests/stretchcluster.yaml
 cat <<'EOF' | kubectl --context rp-failover -n redpanda apply -f -
 apiVersion: cluster.redpanda.com/v1alpha2
-kind: NodePool
+kind: RedpandaBrokerPool
 metadata: { name: rp-failover, namespace: redpanda }
 spec:
   clusterRef: { group: cluster.redpanda.com, kind: StretchCluster, name: redpanda }
   replicas: 2
   image: { repository: redpandadata/redpanda, tag: v26.1.6 }
+  rbac: { enabled: true }
+  external: { enabled: false }
+  rackAwareness: { enabled: true, nodeAnnotation: topology.kubernetes.io/region }
+  tls: { enabled: true, certs: { default: { caEnabled: true } } }
   services: { perPod: { remote: { enabled: true } } }
 EOF
 ```
@@ -864,8 +874,8 @@ Two new brokers (IDs 7, 8) join in rack `us-east1` and start picking up replicas
 Once `Under-replicated partitions: 0` again — meaning the cluster has spare capacity in rack `us-east1` for replicas to migrate to — you can let auto-decommission retire the temporary failover brokers by simply tearing down their infrastructure:
 
 ```bash
-# 1. Remove the failover NodePool, then the operator + cert-manager helm releases.
-kubectl --context rp-failover -n redpanda delete nodepool rp-failover
+# 1. Remove the failover RedpandaBrokerPool, then the operator + cert-manager helm releases.
+kubectl --context rp-failover -n redpanda delete redpandabrokerpool rp-failover
 helm --kube-context rp-failover uninstall rp-failover -n redpanda
 helm --kube-context rp-failover uninstall cert-manager -n cert-manager
 
@@ -930,7 +940,7 @@ Each cloud has a teardown script under `<cloud>/scripts/teardown.sh` that wraps 
 Each script is idempotent — safe to re-run after a partial failure — and goes through the same ordering:
 
 1. **Delete peer Services first** so the cloud's load-balancer controller (AWS LBC, AKS cloud-controller-manager) can clean up its NLB / internal LB while still running.
-2. **Patch finalizers off `NodePool` / `StretchCluster` CRs** so the namespace can finalize after the operator helm release is gone (the operator owns those finalizers; without it, they'd block forever).
+2. **Patch finalizers off `RedpandaBrokerPool` / `StretchCluster` CRs** so the namespace can finalize after the operator helm release is gone (the operator owns those finalizers; without it, they'd block forever).
 3. **Helm-uninstall the operator, cert-manager, and (AWS) the LBC.**
 4. **Force-strip the namespace finalizer** via the `/finalize` subresource if it's still stuck `Terminating`.
 5. **`terraform state rm` the `kubernetes_*` and `helm_release.*` resources** before destroying the cluster — otherwise the kubernetes / helm providers keep retrying against the about-to-be-destroyed API server and `terraform destroy` dies with `context deadline exceeded`.
@@ -944,7 +954,7 @@ Manual fallback — if you want to do it by hand without the script (or to debug
 ```bash
 # 1. Strip CR finalizers so the namespace can finalize once the operator is gone.
 for C in rp-east rp-west rp-eu; do
-  for R in $(kubectl --context $C -n redpanda get nodepool,stretchcluster -o name 2>/dev/null); do
+  for R in $(kubectl --context $C -n redpanda get redpandabrokerpool,stretchcluster -o name 2>/dev/null); do
     kubectl --context $C -n redpanda patch "$R" --type=merge -p '{"metadata":{"finalizers":[]}}'
   done
 done
@@ -1048,7 +1058,7 @@ In flat mode the operator renders headless Services and manages EndpointSlices w
 
 ### 7. `flat` mode set but per-pool Services for remote pools don't exist
 
-Symptom: `kubectl get svc -n redpanda` in `rp-east` shows only `redpanda-rp-east-0`, not `redpanda-rp-west-0` or `redpanda-rp-eu-0`. The operator skips rendering for remote pools when `services.perPod.remote.enabled: false`. Set it to `true` in every NodePool.
+Symptom: `kubectl get svc -n redpanda` in `rp-east` shows only `redpanda-rp-east-0`, not `redpanda-rp-west-0` or `redpanda-rp-eu-0`. The operator skips rendering for remote pools when `services.perPod.remote.enabled: false`. Set it to `true` in every RedpandaBrokerPool.
 
 ### 8. StretchCluster `ResourcesSynced=False`: "spec.clusterIPs[0]: Invalid value: ['None']: may not change once set"
 

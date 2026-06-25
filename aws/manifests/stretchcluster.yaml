@@ -4,66 +4,21 @@ metadata:
   name: redpanda
   namespace: redpanda
 spec:
-  rbac:
-    enabled: true
-  external:
-    enabled: false
+  # NOTE (operator v26.2.1-beta.2 API): the per-broker concerns rbac, external,
+  # rackAwareness, and tls are NOT on StretchCluster anymore — they live on each
+  # RedpandaBrokerPool (the kind that replaced NodePool). StretchCluster now only
+  # carries the cluster-wide settings: networking, enterprise license, and config.
   networking:
-    crossClusterMode: flat
-  # Rack awareness: each broker reads the K8s node's `topology.kubernetes.io/region`
-  # label and uses it as its rack. With the three-region EKS layout that gives
-  # racks of "us-east-1", "us-west-2", "eu-west-1" — the natural failure domain
-  # for a stretch cluster.
-  rackAwareness:
-    enabled: true
-    nodeAnnotation: topology.kubernetes.io/region
-  tls:
-    enabled: true
-    certs:
-      default:
-        caEnabled: true
+    crossClusterMode: flat              # operator manages headless Services + EndpointSlices
   enterprise:
     licenseSecretRef:
       name: redpanda-license
       key: license.key
-  # Cluster-level Redpanda config. spec.config.cluster is an open map
-  # (x-kubernetes-preserve-unknown-fields) that flows directly into the
-  # broker's bootstrap.yaml.
-  #
-  # The values below are tuned for demo / validation:
-  #   - leader pinning prefers us-east-1, falls back to us-west-2, then eu-west-1
-  #   - autobalancer evicts a permanently-gone broker after ~60s
-  # For production, raise the autobalancer timeouts substantially (Redpanda's
-  # defaults are 900s / 600s) so a transient outage doesn't trigger a decommission.
   config:
     cluster:
-      # Ordered failover preference. Redpanda 26.1+ accepts two formats:
-      #   - "racks:<r1>,<r2>,…"          — distributes leaders equally across
-      #                                    listed racks (no priority order)
-      #   - "ordered_racks:<r1>,<r2>,…"  — places leaders in the FIRST listed
-      #                                    rack with reachable brokers, falling
-      #                                    over to <r2>, <r3>, … if higher-
-      #                                    priority racks are all unavailable
-      # https://docs.redpanda.com/current/develop/produce-data/leader-pinning/
-      #
-      # We use ordered_racks so that during a primary-region outage the
-      # leader balancer relocates to a low-RTT fallback (us-east-2 — the
-      # default failover region in aws/terraform-failover) before falling
-      # through to us-west-2 / eu-west-1. The eu-west-1 ↔ us-west-2 RTT
-      # (~140 ms) exceeds Redpanda's hardcoded 100 ms node_status_rpc
-      # timeout, so listing eu-west-1 last keeps it as a last-resort
-      # leader-host and avoids the cluster-health corruption we'd see if
-      # leadership concentrated there.
+      # Ordered leader pinning, primary → failover (us-east-2) → remaining regions.
+      # ordered_racks places leaders in the first reachable rack and falls over to
+      # the next on outage. https://docs.redpanda.com/current/develop/produce-data/leader-pinning/
       default_leaders_preference: "ordered_racks:us-east-1,us-east-2,us-west-2,eu-west-1"
-      # Time a broker can be unreachable before it's marked unavailable for
-      # partition movement. 10 min so Demo A's "scale region to 0 → restore"
-      # cycle finishes before the autobalancer marks the brokers unavailable
-      # (which would trigger an auto-decommission and break Demo A's
-      # "restore the primary" step). Default: 900s. Raise further for prod.
       partition_autobalancing_node_availability_timeout_sec: 600
-      # Time a broker can stay unavailable before the autobalancer issues a
-      # decommission for it. Must be > the availability timeout above. Demo
-      # B observes the autodecom kicking in once a broker stays unavailable
-      # past this threshold; expect to wait ~15 min into Demo B for the
-      # `MEMBERSHIP=draining` state to appear. Default: 600s.
       partition_autobalancing_node_autodecommission_timeout_sec: 900
